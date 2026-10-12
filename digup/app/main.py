@@ -145,10 +145,13 @@ class App:
     def show_settings(self) -> None:
         if self.settings_window is None:
             self.settings_window = SettingsWindow(self.settings)
-            self.settings_window.engine = self.engine
+            self.settings_window.set_engine(self.engine)
             self.settings_window.saved.connect(self._settings_saved)
             self.settings_window.destroyed.connect(lambda: setattr(self, "settings_window", None))
             self.settings_window.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        self.settings_window.tabs.setCurrentIndex(0)
+        if self.settings_window.isMinimized():
+            self.settings_window.showNormal()
         self.settings_window.show()
         self.settings_window.raise_()
         self.settings_window.activateWindow()

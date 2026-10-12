@@ -61,6 +61,14 @@ def stylesheet(p: Palette) -> str:
     #Panel, #Window {{ background: {p.window}; }}
     #Search {{ background: transparent; border: none; font-size: 17pt; padding: 6px 2px;
                selection-background-color: {p.accent}; selection-color: {p.accent_text}; }}
+    #Gear {{ background: transparent; border: none; color: {p.muted}; padding: 4px 8px; border-radius: 6px; }}
+    #Gear:hover {{ background: {p.raised}; color: {p.text}; }}
+    #Card {{ background: {p.surface}; border: 1px solid {p.border}; border-radius: 8px; }}
+    #CardValue {{ font-size: 16pt; font-weight: 600; }}
+    #CardLabel {{ color: {p.muted}; font-size: 8.5pt; }}
+    #Muted {{ color: {p.muted}; }}
+    QHeaderView::section {{ background: {p.raised}; color: {p.muted}; border: none; border-bottom: 1px solid {p.border};
+                            padding: 5px 8px; }}
     #Divider {{ background: {p.border}; max-height: 1px; min-height: 1px; }}
     #Chip {{ background: {p.raised}; border: 1px solid {p.border}; border-radius: 12px; padding: 3px 11px;
              color: {p.muted}; }}

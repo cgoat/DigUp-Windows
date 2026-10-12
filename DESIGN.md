@@ -74,8 +74,9 @@ minutes after the last search; vectors are loaded on the first meaning search an
 
 ## The app
 
-- **Panel** ([panel.py](digup/app/panel.py)): a frameless, always-on-top window over the current screen, with Windows
-  11's rounded corners. Results with thumbnails on the left; a preview on the right (the picture, the PDF page, the
+- **Window** ([panel.py](digup/app/panel.py)): an ordinary window (title bar, resizable, in the taskbar; it stays
+  when focus moves elsewhere, and closing it hides it to the notification area). The hotkey brings it up or
+  minimizes it. Results with thumbnails on the left; a preview on the right (the picture, the PDF page, the
   video frame at its moment with Ctrl+Space to play there, or the passage with the words marked).
 - **Opening at the place** ([opener.py](digup/app/opener.py)): Windows' default handlers can't be told a time or a
   page, so DigUp looks for apps that can (VLC, mpv, MPC-HC, PotPlayer; SumatraPDF, Edge; VS Code, Cursor, Zed,
@@ -83,6 +84,9 @@ minutes after the last search; vectors are loaded on the first meaning search an
 - **Engine** ([engine.py](digup/app/engine.py)): one background thread; syncs at start and when a watched folder
   settles (2 s; code folders 60 s), indexes through a below-normal-priority worker that quits after a minute idle, and
   pauses on request, on battery saver, or on battery when asked.
+- **Overview** ([overview.py](digup/app/overview.py)): Settings' first tab; per-folder counts by kind and state from
+  the index, the files that failed or were left out with why, live status from the engine, and each index's last
+  scan (stored by the engine and the CLI as `last_sync` in the index's meta table).
 - **Single instance**: a second launch asks the running one to open the panel (a local socket).
 - Data lives in `%LOCALAPPDATA%\DigUp` (`Models`, `Runtime`, `Index`, `Logs`, `settings.json`); `DIGUP_HOME` moves
   it (tests, portable use).

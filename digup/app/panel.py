@@ -8,7 +8,7 @@ import html
 import os
 import time
 
-from PySide6.QtCore import (QAbstractListModel, QEvent, QModelIndex, QPoint, QRect, QSize, Qt, QTimer, QUrl,
+from PySide6.QtCore import (QAbstractListModel, QEvent, QModelIndex, QRect, QSize, Qt, QTimer, QUrl,
                             Signal)
 from PySide6.QtGui import QColor, QCursor, QFont, QFontMetrics, QGuiApplication, QImage, QKeySequence, QPainter, QPainterPath, QPixmap, QShortcut, QTextDocument
 from PySide6.QtWidgets import (QAbstractItemView, QButtonGroup, QFrame, QHBoxLayout, QLabel, QLineEdit, QListView,
@@ -329,8 +329,12 @@ class SearchPanel(QWidget):
     open_settings = Signal()
 
     def __init__(self, service: QueryService, settings, engine_status=None):
-        super().__init__(None, Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint)
+        super().__init__(None)  # an ordinary window: a title bar, resizable, in the taskbar, stays when you click away
         self.setObjectName("Panel")
+        self.setWindowTitle("DigUp")
+        self.setWindowIcon(theme.app_icon())
+        self.setMinimumSize(720, 420)
+        self._placed = False
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.service = service
         self.settings = settings
@@ -357,6 +361,14 @@ class SearchPanel(QWidget):
         top.addWidget(icon)
         top.addSpacing(6)
         top.addWidget(self.search, 1)
+        gear = QPushButton("")
+        gear.setObjectName("Gear")
+        gear.setFont(QFont("Segoe Fluent Icons, Segoe MDL2 Assets", 13))
+        gear.setToolTip("Settings, folders and statistics (Ctrl+,)")
+        gear.setCursor(Qt.CursorShape.PointingHandCursor)
+        gear.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        gear.clicked.connect(self._settings)
+        top.addWidget(gear)
         outer.addLayout(top)
         chips = QHBoxLayout()
         chips.setContentsMargins(18, 2, 18, 10)
@@ -408,7 +420,7 @@ class SearchPanel(QWidget):
         self.status.setObjectName("Status")
         self.status.setContentsMargins(18, 6, 18, 8)
         outer.addWidget(self.status)
-        self.hints = "Enter open · Ctrl+Enter show in folder · Ctrl+C copy file · Ctrl+Space play · Tab filter · Esc close"
+        self.hints = "Enter open · Ctrl+Enter show in folder · Ctrl+C copy file · Ctrl+Space play · Tab filter · Esc clear"
         self.engine_line = ""
         self._set_status()
 
@@ -419,7 +431,7 @@ class SearchPanel(QWidget):
         self.search.textChanged.connect(lambda _: self.debounce.start())
         service.results.connect(self._show_results)
         for keys, action in (("Ctrl+Return", self.reveal_selected), ("Ctrl+Enter", self.reveal_selected),
-                             ("Ctrl+,", self._settings), ("Escape", self.hide_panel)):
+                             ("Ctrl+,", self._settings), ("Escape", self._escape)):
             QShortcut(QKeySequence(keys), self, action)
         self._show_empty("Search your pictures, PDFs, documents, recordings and videos by what's in them.\n\n"
                          "Try “a dog on the beach”, “the clause about pets in the lease”, or “code: retry with backoff”.")
@@ -427,21 +439,29 @@ class SearchPanel(QWidget):
     # MARK: Showing and hiding
 
     def toggle(self) -> None:
-        if self.isVisible() and self.isActiveWindow():
-            self.hide_panel()
+        """The hotkey: brings the window up, or minimizes it when it's already in front."""
+        if self.isVisible() and self.isActiveWindow() and not self.isMinimized():
+            self.preview.stop()
+            self.showMinimized()
         else:
             self.show_panel()
 
     def show_panel(self) -> None:
         self.service.warm_up()
-        screen = QGuiApplication.screenAt(QCursor.pos()) or QGuiApplication.primaryScreen()
-        area = screen.availableGeometry()
-        width = min(1040, int(area.width() * 0.72))
-        height = min(600, int(area.height() * 0.66))
-        self.resize(width, height)
-        self.move(area.left() + (area.width() - width) // 2, area.top() + int(area.height() * 0.16))
-        self.show()
-        theme.decorate(self, theme.dark_mode(), frameless=True)
+        if not self._placed:
+            # The first time: centered on the screen with the mouse. After that it stays where you put it.
+            screen = QGuiApplication.screenAt(QCursor.pos()) or QGuiApplication.primaryScreen()
+            area = screen.availableGeometry()
+            width = min(1100, int(area.width() * 0.72))
+            height = min(680, int(area.height() * 0.72))
+            self.resize(width, height)
+            self.move(area.left() + (area.width() - width) // 2, area.top() + int(area.height() * 0.12))
+            self._placed = True
+        if self.isMinimized():
+            self.showNormal()
+        else:
+            self.show()
+        theme.decorate(self, theme.dark_mode())
         self.raise_()
         self.activateWindow()
         self._force_foreground()
@@ -461,13 +481,18 @@ class SearchPanel(QWidget):
         self.preview.stop()
         self.hide()
 
-    def changeEvent(self, event) -> None:
-        if event.type() == QEvent.Type.ActivationChange and not self.isActiveWindow() and self.isVisible():
-            QTimer.singleShot(120, lambda: (not self.isActiveWindow()) and self.hide_panel())
-        super().changeEvent(event)
+    def closeEvent(self, event) -> None:
+        """Closing the window keeps DigUp running in the notification area (Quit is in its menu)."""
+        self.preview.stop()
+        event.ignore()
+        self.hide()
+
+    def _escape(self) -> None:
+        if self.search.text():
+            self.search.clear()
+        self.search.setFocus()
 
     def _settings(self) -> None:
-        self.hide_panel()
         self.open_settings.emit()
 
     # MARK: Searching
@@ -544,13 +569,11 @@ class SearchPanel(QWidget):
         self.preview.stop()
         message = opener.open_hit(hit, self.settings, self.words)
         self._set_status(message)
-        self.hide_panel()
 
     def reveal_selected(self) -> None:
         hit = self.current_hit()
         if hit:
             opener.reveal(hit.path)
-            self.hide_panel()
 
     def copy_selected(self) -> None:
         hit = self.current_hit()

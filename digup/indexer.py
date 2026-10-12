@@ -16,7 +16,7 @@ from typing import Callable
 
 from . import codeextract, crawler, extractors, media, paths, searchtext
 from .model import FileKind, IndexOptions, Modality, Prompts, SegmentKind, WorkerError
-from .store import Candidate, FileRecord, IndexStore
+from .store import FileRecord, IndexStore
 
 
 class FingerprintMismatch(Exception):

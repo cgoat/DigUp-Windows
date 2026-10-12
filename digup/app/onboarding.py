@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import os
 import threading
-import time
 
 from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtWidgets import (QCheckBox, QFileDialog, QHBoxLayout, QLabel, QProgressBar, QPushButton, QScrollArea,

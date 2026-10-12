@@ -50,16 +50,23 @@ telemetry.
 
 | Key | What it does |
 |---|---|
-| Ctrl+Shift+Space | Opens the search panel from any app (change it in Settings) |
+| Ctrl+Shift+Space | Brings up the DigUp window from any app, or minimizes it when it's in front (change it in Settings) |
 | ↓ ↑ | Moves through the results |
 | Enter | Opens the result: videos and recordings at the moment, PDFs at the page, code in your editor at the line |
 | Ctrl+Enter | Shows it in File Explorer |
 | Ctrl+C | Copies the file, to paste anywhere |
 | Ctrl+Space | Plays the video or recording in the preview, from the moment it matched |
 | Tab | Narrows to pictures, screenshots, PDFs, documents, audio or video |
-| Esc | Closes the panel |
+| Esc | Clears the search |
+| Ctrl+, | Opens Settings |
 
-DigUp lives in the notification area, where you can see how indexing is going, pause it, or open Settings.
+DigUp's window behaves like any other: move it, resize it, switch away and back. Closing it keeps DigUp running in
+the notification area (Quit is in its menu), where you can also see how indexing is going and pause it.
+
+The ⚙ button opens Settings at the **Overview**: every folder DigUp has scanned with how many files are searchable
+and what kinds, how many are waiting, which files couldn't be read and why, how much room the index takes, when each
+folder was last read, and what the last scan found, changed and left out. Scans are incremental: only new and changed
+files are read again; **Scan now** runs one by hand.
 
 To open a video **at the moment**, DigUp uses VLC, mpv, MPC-HC or PotPlayer if one is installed (Windows' own players
 can't be told where to start); otherwise the video opens from the start. PDFs open at the page in SumatraPDF or

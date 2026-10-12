@@ -3,19 +3,19 @@
 from __future__ import annotations
 
 import os
-import subprocess
 import sys
 import winreg
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Signal
 from PySide6.QtGui import QKeySequence
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QFileDialog, QFormLayout, QHBoxLayout, QKeySequenceEdit, QLabel,
-                               QLineEdit, QListWidget, QMessageBox, QPushButton, QTabWidget, QVBoxLayout, QWidget)
+                               QLineEdit, QListWidget, QPushButton, QTabWidget, QVBoxLayout, QWidget)
 
 from .. import downloads, paths
 from ..settings import Settings
-from ..store import CODE_FILE, MAIN_FILE, IndexStore
+from ..store import CODE_FILE
 from . import opener, theme
+from .overview import OverviewPage
 
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
@@ -84,7 +84,7 @@ class SettingsWindow(QWidget):
         self.setObjectName("Window")
         self.setWindowTitle("DigUp Settings")
         self.setWindowIcon(theme.app_icon())
-        self.resize(640, 540)
+        self.resize(1080, 680)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(18, 14, 18, 14)
         tabs = QTabWidget()
@@ -163,29 +163,11 @@ class SettingsWindow(QWidget):
         form.addRow("Run the model on:", self.backend)
         tabs.addTab(page, "General")
 
-        # Index
-        page = QWidget()
-        v = QVBoxLayout(page)
-        self.summary = QLabel()
-        self.summary.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.summary.setAlignment(Qt.AlignmentFlag.AlignTop)
-        self.summary.setWordWrap(True)
-        v.addWidget(self.summary, 1)
-        row = QHBoxLayout()
-        refresh = QPushButton("Refresh")
-        retry = QPushButton("Try failed files again")
-        rebuild = QPushButton("Read everything again")
-        logs = QPushButton("Open logs")
-        refresh.clicked.connect(self.refresh_summary)
-        retry.clicked.connect(self._retry)
-        rebuild.clicked.connect(self._rebuild)
-        logs.clicked.connect(lambda: os.startfile(str(paths.logs())) if paths.logs().exists() else None)
-        for b in (refresh, retry, rebuild, logs):
-            row.addWidget(b)
-        row.addStretch(1)
-        v.addLayout(row)
-        tabs.addTab(page, "Index")
-        tabs.currentChanged.connect(lambda i: i == 3 and self.refresh_summary())
+        # Overview: first, as the Settings button opens it
+        self.overview = OverviewPage(settings)
+        tabs.insertTab(0, self.overview, "Overview")
+        tabs.setCurrentIndex(0)
+        self.tabs = tabs
 
         buttons = QHBoxLayout()
         buttons.addStretch(1)
@@ -203,50 +185,9 @@ class SettingsWindow(QWidget):
         theme.decorate(self, theme.dark_mode())
         super().showEvent(event)
 
-    def refresh_summary(self) -> None:
-        lines = [f"Data folder: {paths.home()}",
-                 f"Model runs on: llama.cpp {downloads.LLAMA_TAG}, {self.settings.backend_choice or downloads.best_backend()}",
-                 ""]
-        for name, label in ((MAIN_FILE, "Files"), (CODE_FILE, "Code")):
-            file = paths.index() / name
-            if not file.exists():
-                continue
-            store = IndexStore(paths.index(), name)
-            counts = store.counts()
-            lines.append(f"{label}: {counts['vectors']:,} vectors, {IndexStore.size_of(file) / 1e6:.0f} MB")
-            for kind, states in sorted(counts["by_kind_and_state"].items()):
-                lines.append(f"    {kind}: " + ", ".join(f"{n:,} {s}" for s, n in sorted(states.items())))
-            failed = store.db.execute("SELECT path, detail FROM files WHERE state = 'failed' LIMIT 8").fetchall()
-            if failed:
-                lines.append("    Couldn't read:")
-                lines += [f"      {os.path.basename(p)}: {d}" for p, d in failed]
-            store.close()
-            lines.append("")
-        self.summary.setText("\n".join(lines))
-
-    def _retry(self) -> None:
-        for name in (MAIN_FILE, CODE_FILE):
-            if (paths.index() / name).exists():
-                store = IndexStore(paths.index(), name)
-                store.retry_failed()
-                store.close()
-        if self.engine:
-            self.engine.resync()
-        self.refresh_summary()
-
-    def _rebuild(self) -> None:
-        if QMessageBox.question(self, "Read everything again?",
-                                "DigUp will read and embed every file again. That takes as long as the first pass.") \
-                != QMessageBox.StandardButton.Yes:
-            return
-        for name in (MAIN_FILE, CODE_FILE):
-            if (paths.index() / name).exists():
-                store = IndexStore(paths.index(), name)
-                store.reset_all()
-                store.close()
-        if self.engine:
-            self.engine.resync()
-        self.refresh_summary()
+    def set_engine(self, engine) -> None:
+        self.engine = engine
+        self.overview.set_engine(engine)
 
     def _save(self) -> None:
         s = self.settings

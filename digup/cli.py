@@ -75,6 +75,13 @@ def cmd_index(args) -> int:
     started = time.time()
     summary = indexer.sync(roots)
     c = summary.crawl
+    import json
+
+    store.set_meta("last_sync", json.dumps({
+        "time": time.time(), "added": summary.added, "changed": summary.changed, "moved": summary.moved,
+        "removed": summary.removed, "unchanged": summary.unchanged, "skipped": c.skipped,
+        "skipped_folders": c.skipped_folders, "datasets": c.datasets, "missing": [r for r in roots if not os.path.isdir(r)],
+    }))
     print(f"sync: {summary.added} new, {summary.changed} changed, {summary.moved} moved, {summary.removed} removed, "
           f"{summary.unchanged} unchanged ({time.time() - started:.1f} s)")
     if c.skipped:

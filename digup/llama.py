@@ -410,7 +410,7 @@ class LlamaEmbedder:
         return bitmap
 
     def _embed_media(self, bitmap, path: str) -> list[float]:
-        L, M = self.lib.llama, self.lib.mtmd
+        M = self.lib.mtmd
         chunks = M.mtmd_input_chunks_init()
         try:
             marker = M.mtmd_default_marker()

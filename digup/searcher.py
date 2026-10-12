@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from . import codeextract, searchtext
-from .model import DIM, FileKind, IndexOptions, Modality, SegmentKind
+from .model import DIM, FileKind, IndexOptions, SegmentKind
 from .store import IndexStore
 
 

@@ -260,7 +260,6 @@ def _xml_text(path: str, member: str, paragraph: str, tab: str) -> str:
 def rtf_to_text(rtf: str) -> str:
     """Good enough for search: drops groups that hold no text (fonts, colors, pictures), decodes escapes."""
     out, stack, ignorable = [], [], False
-    i, n = 0, len(rtf)
     skip_destinations = {"fonttbl", "colortbl", "stylesheet", "info", "pict", "object", "header", "footer",
                          "datastore", "themedata", "listtable", "listoverridetable", "rsidtbl", "xmlnstbl",
                          "generator", "latentstyles"}

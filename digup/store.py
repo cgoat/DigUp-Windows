@@ -336,6 +336,33 @@ class IndexStore:
 
     # MARK: Stats
 
+    def folder_stats(self, root: str) -> dict:
+        """What the index holds under `root`: files by kind and state, their bytes, vectors, and the last file read."""
+        p = paths.prefix(root)
+        stats = {"kinds": {}, "states": {}, "files": 0, "bytes": 0, "vectors": 0, "last": None}
+        for kind, state, n, size, last in self.db.execute(
+            "SELECT kind, state, COUNT(*), SUM(size), MAX(indexed_at) FROM files WHERE path >= ? AND path < ? "
+            "GROUP BY kind, state", (p, p + _END)
+        ):
+            stats["files"] += n
+            stats["bytes"] += size or 0
+            stats["states"][state] = stats["states"].get(state, 0) + n
+            if state in ("done", "partial"):
+                stats["kinds"][kind] = stats["kinds"].get(kind, 0) + n
+            if last and (stats["last"] is None or last > stats["last"]):
+                stats["last"] = last
+        stats["vectors"] = self.db.execute(
+            "SELECT COUNT(s.vec) FROM segments s JOIN files f ON f.id = s.file WHERE f.path >= ? AND f.path < ?",
+            (p, p + _END)).fetchone()[0]
+        return stats
+
+    def problems(self, root: str, limit: int = 200) -> list[tuple[str, str, str]]:
+        """Files under `root` that failed or were skipped after reading, with why: (path, state, detail)."""
+        p = paths.prefix(root)
+        return self.db.execute(
+            "SELECT path, state, coalesce(detail, '') FROM files WHERE path >= ? AND path < ? "
+            "AND state IN ('failed', 'skipped') ORDER BY state, path LIMIT ?", (p, p + _END, limit)).fetchall()
+
     def counts(self) -> dict:
         by: dict[str, dict[str, int]] = {}
         for kind, state, n in self.db.execute(

@@ -98,6 +98,8 @@ class IndexStore:
         self.db = sqlite3.connect(self.file, timeout=5, isolation_level=None, check_same_thread=False)
         self.db.execute("PRAGMA journal_mode = WAL")
         self.db.execute("PRAGMA synchronous = NORMAL")
+        # The log is cut back to this after each checkpoint, instead of keeping its largest size for good.
+        self.db.execute("PRAGMA journal_size_limit = 67108864")
         self.db.execute("PRAGMA foreign_keys = ON")
         self._scope_sql = ""
         self._scope_values: list = []
@@ -131,6 +133,11 @@ class IndexStore:
                         self.db.execute(statement)
                 self.db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         self.db.execute("PRAGMA busy_timeout = 5000")
+        # Counting vectors without reading them: modality is 'none' exactly when a segment has no vector.
+        try:
+            self.db.execute("CREATE INDEX IF NOT EXISTS segments_modality ON segments(modality)")
+        except sqlite3.OperationalError:
+            pass  # another process holds the write lock; it will be made next time
 
     class _Transaction:
         def __init__(self, db: sqlite3.Connection):
@@ -224,6 +231,18 @@ class IndexStore:
             (searchtext.normalized(name_text(path)), searchtext.normalized(folder_text(path)), id),
         )
 
+    def delete_many(self, ids: list[int], chunk: int = 20_000) -> None:
+        """Removes many files at once (a folder taken out, a rule that now leaves it out): set-based, so two million
+        rows take minutes rather than hours. Runs inside the caller's transaction."""
+        self.db.execute("CREATE TEMP TABLE IF NOT EXISTS gone(id INTEGER PRIMARY KEY)")
+        for start in range(0, len(ids), chunk):
+            self.db.execute("DELETE FROM gone")
+            self.db.executemany("INSERT OR IGNORE INTO gone(id) VALUES(?)", ((i,) for i in ids[start:start + chunk]))
+            self.db.execute("DELETE FROM fts WHERE rowid IN (SELECT s.id FROM segments s JOIN gone g ON g.id = s.file)")
+            self.db.execute("DELETE FROM segments WHERE file IN (SELECT id FROM gone)")
+            self.db.execute("DELETE FROM files WHERE id IN (SELECT id FROM gone)")
+        self.db.execute("DELETE FROM gone")
+
     def delete(self, id: int) -> None:
         self.db.execute("DELETE FROM fts WHERE rowid IN (SELECT id FROM segments WHERE file = ?)", (id,))
         self.db.execute("DELETE FROM files WHERE id = ?", (id,))
@@ -237,8 +256,7 @@ class IndexStore:
         ]
         if gone:
             with self.transaction():
-                for id in gone:
-                    self.delete(id)
+                self.delete_many(gone)
         return len(gone)
 
     def reset_all(self) -> None:
@@ -336,10 +354,35 @@ class IndexStore:
 
     # MARK: Stats
 
+    def vector_count(self) -> int:
+        """How many vectors the index holds (from an index on `modality`: no vector is read)."""
+        return self.db.execute("SELECT COUNT(*) FROM segments WHERE modality != 'none'").fetchone()[0]
+
+    def checkpoint(self) -> None:
+        """Copies the write-ahead log into the database and cuts the log back (after a burst of writes)."""
+        try:
+            self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.OperationalError:
+            pass
+
+    def compact_if_worthwhile(self, min_free_bytes: int = 1 << 30, min_share: float = 0.25) -> bool:
+        """Gives free space back to the disk (VACUUM) when a lot of the file is unused, as after removing a big
+        folder. Takes a while on a big index; the caller runs it off the UI thread."""
+        pages, free, size = (self.db.execute(f"PRAGMA {p}").fetchone()[0]
+                             for p in ("page_count", "freelist_count", "page_size"))
+        if free * size < min_free_bytes or free < pages * min_share:
+            return False
+        try:
+            self.db.execute("VACUUM")
+            self.checkpoint()
+            return True
+        except sqlite3.OperationalError:
+            return False
+
     def folder_stats(self, root: str) -> dict:
         """What the index holds under `root`: files by kind and state, their bytes, vectors, and the last file read."""
         p = paths.prefix(root)
-        stats = {"kinds": {}, "states": {}, "files": 0, "bytes": 0, "vectors": 0, "last": None}
+        stats = {"kinds": {}, "states": {}, "files": 0, "bytes": 0, "last": None}
         for kind, state, n, size, last in self.db.execute(
             "SELECT kind, state, COUNT(*), SUM(size), MAX(indexed_at) FROM files WHERE path >= ? AND path < ? "
             "GROUP BY kind, state", (p, p + _END)
@@ -351,19 +394,20 @@ class IndexStore:
                 stats["kinds"][kind] = stats["kinds"].get(kind, 0) + n
             if last and (stats["last"] is None or last > stats["last"]):
                 stats["last"] = last
-        stats["vectors"] = self.db.execute(
-            "SELECT COUNT(s.vec) FROM segments s JOIN files f ON f.id = s.file WHERE f.path >= ? AND f.path < ?",
-            (p, p + _END)).fetchone()[0]
         return stats
 
     def problems(self, root: str, limit: int = 200) -> list[tuple[str, str, str]]:
-        """Files under `root` that failed or were skipped after reading, with why: (path, state, detail)."""
+        """Files under `root` that failed or were skipped after reading, with why: (path, state, detail). Pictures
+        left out for being small (icons, thumbnails) are expected and not listed."""
         p = paths.prefix(root)
         return self.db.execute(
             "SELECT path, state, coalesce(detail, '') FROM files WHERE path >= ? AND path < ? "
-            "AND state IN ('failed', 'skipped') ORDER BY state, path LIMIT ?", (p, p + _END, limit)).fetchall()
+            "AND state IN ('failed', 'skipped') AND coalesce(detail, '') NOT LIKE 'small image%' "
+            "ORDER BY state, path LIMIT ?", (p, p + _END, limit)).fetchall()
 
-    def counts(self) -> dict:
+    def counts(self, light: bool = False) -> dict:
+        """Files by kind and state, long files left, segments and vectors. `light` leaves out the segment count,
+        which reads the whole segments table (seconds on a million-segment index)."""
         by: dict[str, dict[str, int]] = {}
         for kind, state, n in self.db.execute(
             f"SELECT kind, state, COUNT(*) FROM files WHERE 1{self._scope_sql} GROUP BY kind, state",
@@ -372,9 +416,10 @@ class IndexStore:
             by.setdefault(kind, {})[state] = n
         unfinished, left = self.unfinished_count()
         in_scope = "" if not self._scope_sql else f" AND file IN (SELECT id FROM files WHERE 1{self._scope_sql})"
-        segments, vectors = self.db.execute(
-            f"SELECT COUNT(*), COUNT(vec) FROM segments WHERE kind != 'name'{in_scope}", self._scope_values
-        ).fetchone()
+        segments = None if light else self.db.execute(
+            f"SELECT COUNT(*) FROM segments WHERE kind != 'name'{in_scope}", self._scope_values).fetchone()[0]
+        vectors = self.db.execute(
+            f"SELECT COUNT(*) FROM segments WHERE modality != 'none'{in_scope}", self._scope_values).fetchone()[0]
         return {"by_kind_and_state": by, "segments": segments, "vectors": vectors, "unfinished": unfinished,
                 "left": left}
 

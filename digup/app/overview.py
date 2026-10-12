@@ -5,9 +5,10 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtWidgets import (QAbstractItemView, QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLabel, QMessageBox,
                                QPushButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
 
@@ -44,6 +45,11 @@ def ago(t: float | None) -> str:
     return time.strftime("%d %b %Y", time.localtime(t))
 
 
+class _Bridge(QObject):
+    collected = Signal(object)
+    worked = Signal()  # an index-wide change finished
+
+
 class Card(QFrame):
     def __init__(self, label: str):
         super().__init__()
@@ -71,13 +77,23 @@ class OverviewPage(QWidget):
         self.engine = None
         self._stores: dict[str, IndexStore] = {}
         self._last_refresh = 0.0
+        self._busy = False
+        self._again = False
+        self._bridge = _Bridge()
+        self._bridge.collected.connect(self._apply)
+        self._bridge.worked.connect(lambda: (self._scan(), self.refresh()))
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 10, 0, 0)
         layout.setSpacing(10)
 
+        top = QHBoxLayout()
         self.status = QLabel("—")
         self.status.setWordWrap(True)
-        layout.addWidget(self.status)
+        self.updating = QLabel("")
+        self.updating.setObjectName("Muted")
+        top.addWidget(self.status, 1)
+        top.addWidget(self.updating)
+        layout.addLayout(top)
 
         cards = QGridLayout()
         cards.setSpacing(8)
@@ -127,7 +143,7 @@ class OverviewPage(QWidget):
         layout.addLayout(row)
 
         self._timer = QTimer(self)
-        self._timer.setInterval(4000)
+        self._timer.setInterval(15000)
         self._timer.timeout.connect(lambda: self.isVisible() and self.refresh())
 
     # MARK: Live status
@@ -156,7 +172,7 @@ class OverviewPage(QWidget):
             text = "<b>Up to date.</b> New and changed files are read a few seconds after they land."
         self.status.setText(text)
         # Keep the numbers moving while it works, without re-reading the index on every file.
-        if self.isVisible() and time.time() - self._last_refresh > 2.5:
+        if self.isVisible() and time.time() - self._last_refresh > 15:
             self.refresh()
 
     def showEvent(self, event) -> None:
@@ -168,9 +184,10 @@ class OverviewPage(QWidget):
         self._timer.stop()
         super().hideEvent(event)
 
-    # MARK: The numbers
+    # MARK: The numbers (read on a background thread: on a big index they take seconds)
 
     def _store(self, name: str) -> IndexStore | None:
+        """The background thread's connection to an index (one refresh runs at a time)."""
         if not (paths.index() / name).exists():
             return None
         if name not in self._stores:
@@ -178,40 +195,91 @@ class OverviewPage(QWidget):
         return self._stores[name]
 
     def refresh(self) -> None:
+        """Starts reading the numbers; the page shows them when they're in. A refresh asked for while one runs
+        happens once it's done."""
         self._last_refresh = time.time()
-        expanded = {self.tree.topLevelItem(i).data(0, PATH_ROLE) for i in range(self.tree.topLevelItemCount())
-                    if self.tree.topLevelItem(i).isExpanded()}
-        self.tree.clear()
-        totals = {"searchable": 0, "waiting": 0, "failed": 0, "vectors": 0}
-        groups = [(MAIN_FILE, self.settings.folders, None)]
+        if self._busy:
+            self._again = True
+            return
+        self._busy = True
+        self.updating.setText("Updating…")
+        groups = [(MAIN_FILE, list(self.settings.folders), None)]
         if self.settings.code_search and self.settings.code_folders:
-            groups.append((CODE_FILE, self.settings.code_folders, "Code search"))
+            groups.append((CODE_FILE, list(self.settings.code_folders), "Code search"))
+        threading.Thread(target=self._collect_in_background, args=(groups,), daemon=True).start()
+
+    def _collect_in_background(self, groups) -> None:
+        try:
+            data = self._collect(groups)
+        except Exception as error:  # noqa: BLE001 - shown on the page
+            data = {"error": str(error)}
+        try:
+            self._bridge.collected.emit(data)
+        except RuntimeError:
+            pass  # the window closed meanwhile
+
+    def _collect(self, groups) -> dict:
+        data = {"groups": [], "vectors": 0, "scans": []}
         for name, folders, title in groups:
             store = self._store(name)
+            rows = []
+            for folder in folders:
+                empty = {"kinds": {}, "states": {}, "files": 0, "bytes": 0, "last": None}
+                rows.append({
+                    "folder": folder,
+                    "connected": os.path.isdir(folder),
+                    "stats": store.folder_stats(folder) if store else empty,
+                    "problems": store.problems(folder) if store else [],
+                })
+            data["groups"].append((name, title, rows))
+            if store:
+                data["vectors"] += store.vector_count()
+                data["scans"].append((name, store.meta("last_sync")))
+        data["size"] = sum(IndexStore.size_of(paths.index() / n) for n in (MAIN_FILE, CODE_FILE)
+                           if (paths.index() / n).exists())
+        backend = self.settings.backend_choice or downloads.best_backend()
+        data["backend"] = backend
+        data["ready"] = downloads.runtime_ready(backend) and downloads.models_complete()
+        return data
+
+    def _apply(self, data: dict) -> None:
+        self._busy = False
+        self.updating.setText("")
+        if self._again:
+            self._again = False
+            QTimer.singleShot(0, self.refresh)
+        if "error" in data:
+            self.updating.setText(f"Couldn't read the index: {data['error']}")
+            return
+        expanded = set()
+        for i in range(self.tree.topLevelItemCount()):
+            top = self.tree.topLevelItem(i)
+            for item in [top] + [top.child(j) for j in range(top.childCount())]:
+                if item.isExpanded() and item.data(0, PATH_ROLE):
+                    expanded.add(item.data(0, PATH_ROLE))
+        self.tree.setUpdatesEnabled(False)
+        self.tree.clear()
+        totals = {"searchable": 0, "waiting": 0, "failed": 0}
+        for name, title, rows in data["groups"]:
             parent = None
             if title:
                 parent = QTreeWidgetItem([title])
                 self.tree.addTopLevelItem(parent)
                 parent.setFirstColumnSpanned(True)
                 parent.setExpanded(True)
-            for folder in folders:
-                stats = store.folder_stats(folder) if store else {"kinds": {}, "states": {}, "files": 0, "bytes": 0,
-                                                                  "vectors": 0, "last": None}
-                states = stats["states"]
+            for row in rows:
+                folder, stats = row["folder"], row["stats"]
+                states, kinds = stats["states"], stats["kinds"]
                 searchable = states.get("done", 0) + states.get("partial", 0)
-                waiting = states.get("pending", 0)
-                failed = states.get("failed", 0)
+                waiting, failed, partial = states.get("pending", 0), states.get("failed", 0), states.get("partial", 0)
                 totals["searchable"] += searchable
                 totals["waiting"] += waiting
                 totals["failed"] += failed
-                totals["vectors"] += stats["vectors"]
                 label = folder.replace(os.path.expanduser("~"), "~", 1)
-                if not os.path.isdir(folder):
+                if not row["connected"]:
                     label += "  (not connected)"
-                kinds = stats["kinds"]
                 contents = " · ".join(f"{kinds[k]:,} {one if kinds[k] == 1 else many}"
                                       for k, one, many in KIND_NAMES if kinds.get(k))
-                partial = states.get("partial", 0)
                 values = [
                     label, f"{searchable:,}", contents or ("nothing read yet" if waiting else "nothing to read"),
                     f"{waiting:,}" + (f" (+{partial:,} long files finishing)" if partial else "") if waiting or partial else "",
@@ -224,13 +292,12 @@ class OverviewPage(QWidget):
                 item.setToolTip(2, contents)
                 for column in (1, 3, 4, 5):
                     item.setTextAlignment(column, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-                if store:
-                    for path, state, detail in store.problems(folder):
-                        why = "couldn't read" if state == "failed" else "left out"
-                        child = QTreeWidgetItem([f"{os.path.relpath(path, folder)}  —  {why}: {detail}"])
-                        child.setData(0, PATH_ROLE, path)
-                        child.setToolTip(0, f"{path}\n{detail}")
-                        item.addChild(child)
+                for path, state, detail in row["problems"]:
+                    why = "couldn't read" if state == "failed" else "left out"
+                    child = QTreeWidgetItem([f"{os.path.relpath(path, folder)}  —  {why}: {detail}"])
+                    child.setData(0, PATH_ROLE, path)
+                    child.setToolTip(0, f"{path}\n{detail}")
+                    item.addChild(child)
                 (parent.addChild if parent else self.tree.addTopLevelItem)(item)
                 for i in range(item.childCount()):  # spanning works once the row is in the tree
                     item.child(i).setFirstColumnSpanned(True)
@@ -240,26 +307,21 @@ class OverviewPage(QWidget):
             empty = QTreeWidgetItem(["No folders yet: add some in the Folders tab."])
             self.tree.addTopLevelItem(empty)
             empty.setFirstColumnSpanned(True)
+        self.tree.setUpdatesEnabled(True)
 
-        size = sum(IndexStore.size_of(paths.index() / n) for n in (MAIN_FILE, CODE_FILE) if (paths.index() / n).exists())
         self.c_files.set(f"{totals['searchable']:,}")
         self.c_waiting.set(f"{totals['waiting']:,}")
         self.c_failed.set(f"{totals['failed']:,}", "Expand a folder below to see which files and why")
-        self.c_vectors.set(f"{totals['vectors']:,}")
-        self.c_size.set(human_bytes(size), str(paths.index()))
-        backend = self.settings.backend_choice or downloads.best_backend()
-        ready = downloads.runtime_ready(backend) and downloads.models_complete()
+        self.c_vectors.set(f"{data['vectors']:,}")
+        self.c_size.set(human_bytes(data["size"]), str(paths.index()))
+        backend = data["backend"]
         self.c_model.set({"cuda": "NVIDIA GPU", "vulkan": "GPU (Vulkan)", "cpu": "CPU"}.get(backend, backend)
-                         + ("" if ready else " (downloading)"),
+                         + ("" if data["ready"] else " (downloading)"),
                          f"EmbeddingGemma 2 (Q8_0) on llama.cpp {downloads.LLAMA_TAG}, {backend}")
-        lines = [self._last_scan_text(MAIN_FILE, "Last scan")]
-        if self.settings.code_search and self.settings.code_folders:
-            lines.append(self._last_scan_text(CODE_FILE, "Last code scan"))
-        self.last_scan.setText("\n".join(line for line in lines if line))
+        titles = {MAIN_FILE: "Last scan", CODE_FILE: "Last code scan"}
+        self.last_scan.setText("\n".join(self._last_scan_text(raw, titles[name]) for name, raw in data["scans"]))
 
-    def _last_scan_text(self, name: str, title: str) -> str:
-        store = self._store(name)
-        raw = store.meta("last_sync") if store else None
+    def _last_scan_text(self, raw: str | None, title: str) -> str:
         if not raw:
             return f"{title}: not yet."
         try:
@@ -278,6 +340,10 @@ class OverviewPage(QWidget):
             text += "."
         if skipped.get("other type"):
             text += f"  {skipped['other type']:,} files of other types (apps, archives…) were passed over."
+        folders = scan.get("skipped_folders") or {}
+        if folders:
+            text += "  Folders not walked into: " + ", ".join(
+                f"{k} ({v:,})" for k, v in sorted(folders.items(), key=lambda kv: -kv[1])) + "."
         for folder, n in (scan.get("datasets") or {}).items():
             text += f"  Left out as a dataset: {folder} ({n:,} files)."
         missing = scan.get("missing") or []
@@ -301,25 +367,33 @@ class OverviewPage(QWidget):
             self.engine.resync()
             self.status.setText("<b>Scanning</b> your folders for new and changed files…")
 
+    def _in_background(self, label: str, work) -> None:
+        """Index-wide changes take a while on a big index: run them off the UI thread, then scan and refresh."""
+        self.updating.setText(label)
+
+        def run():
+            for name in (MAIN_FILE, CODE_FILE):
+                if (paths.index() / name).exists():
+                    store = IndexStore(paths.index(), name)  # its own connection, in this thread
+                    try:
+                        work(store)
+                    finally:
+                        store.close()
+            try:
+                self._bridge.worked.emit()
+            except RuntimeError:
+                pass  # the window closed meanwhile
+
+        threading.Thread(target=run, daemon=True).start()
+
     def _retry(self) -> None:
-        for name in (MAIN_FILE, CODE_FILE):
-            store = self._store(name)
-            if store:
-                store.retry_failed()
-        self._scan()
-        self.refresh()
+        self._in_background("Queuing failed files again…", lambda store: store.retry_failed())
 
     def _rebuild(self) -> None:
         if QMessageBox.question(self, "Read everything again?",
-                                "DigUp will read and embed every file again. That takes as long as the first scan.") \
-                != QMessageBox.StandardButton.Yes:
+                                "DigUp will read and embed every file again. That takes as long as the first scan.")                 != QMessageBox.StandardButton.Yes:
             return
-        for name in (MAIN_FILE, CODE_FILE):
-            store = self._store(name)
-            if store:
-                store.reset_all()
-        self._scan()
-        self.refresh()
+        self._in_background("Emptying the index…", lambda store: store.reset_all())
 
     def _open_data(self) -> None:
         paths.home().mkdir(parents=True, exist_ok=True)

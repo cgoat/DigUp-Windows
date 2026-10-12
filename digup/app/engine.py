@@ -207,6 +207,8 @@ class Engine(QObject):
                     worked |= self._index(indexer, name)
                 if worked:
                     last_work = time.time()
+                    for ix in indexers.values():
+                        ix.store.checkpoint()
             except WorkerError as error:
                 self.message.emit(f"The model stopped: {error}")
                 self._emit(phase="error", note=str(error)[:200])
@@ -260,16 +262,23 @@ class Engine(QObject):
         connected = [r for r in roots if os.path.isdir(r)]
         indexer.store.set_scope(connected)
         summary = indexer.sync(connected, self._should_stop)
-        # What this scan found, for Settings: when, what changed, and what was left out and why.
+        if summary.removed > 10_000:
+            # A big folder went (or a rule now leaves it out): give the space back to the disk.
+            self._emit(phase="syncing", note="compacting the index", current="")
+            indexer.store.checkpoint()
+            indexer.store.compact_if_worthwhile()
+        # What this scan found, for Settings: when, what changed, and what was left out and why (a scan stopped
+        # partway, by pausing or quitting, saw only part of the folders and isn't recorded).
         import json
 
         report = summary.crawl
-        indexer.store.set_meta("last_sync", json.dumps({
-            "time": time.time(), "added": summary.added, "changed": summary.changed, "moved": summary.moved,
-            "removed": summary.removed, "unchanged": summary.unchanged, "skipped": report.skipped if report else {},
-            "skipped_folders": report.skipped_folders if report else {},
-            "datasets": report.datasets if report else {}, "missing": [r for r in roots if r not in connected],
-        }))
+        if report and report.complete:
+            indexer.store.set_meta("last_sync", json.dumps({
+                "time": time.time(), "added": summary.added, "changed": summary.changed, "moved": summary.moved,
+                "removed": summary.removed, "unchanged": summary.unchanged, "skipped": report.skipped,
+                "skipped_folders": report.skipped_folders, "datasets": report.datasets,
+                "missing": [r for r in roots if r not in connected],
+            }))
         if summary.added or summary.changed or summary.moved or summary.removed:
             self.changed.emit(name)
         return bool(summary.added or summary.changed)
@@ -304,7 +313,7 @@ class Engine(QObject):
         out = {}
         for name, ix in indexers.items():
             try:
-                out[name] = ix.store.counts()
+                out[name] = ix.store.counts(light=True)
             except Exception:
                 pass
         return out

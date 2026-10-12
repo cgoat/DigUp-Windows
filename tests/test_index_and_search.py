@@ -153,3 +153,34 @@ def test_find_similar_uses_the_stored_vector(tmp_path):
     assert searcher.vector_of(name_row, r"C:\p\beach.jpg") is not None
     hits = [h.path for h in searcher.search("", vector) if h.path != r"C:\p\beach.jpg"]
     assert hits[0] == r"C:\p\beach2.jpg" and r"C:\p\city.jpg" not in hits
+
+
+def test_backup_folders_are_left_out_and_removed_in_bulk(tmp_path, folder):
+    store, indexer, _ = make(tmp_path, folder)
+    backup = folder / "FileHistory" / "user" / "Data" / "$OF"
+    backup.mkdir(parents=True)
+    for i in range(50):
+        (backup / f"{i}.txt").write_text(f"backup copy {i}", "utf-8")
+    # As an older DigUp indexed them, before the rule: then the rule removes them in one go.
+    from digup.crawler import CrawlReport
+    from digup.store import Candidate as C
+
+    with store.transaction():
+        for i in range(50):
+            p = str(backup / f"{i}.txt")
+            store.insert(C(p, FileKind.DOC, 1, 1.0, 10_000 + i, 1))
+    summary = indexer.sync([str(folder)])
+    assert summary.removed == 50
+    assert not [r for r in store.files_under([str(folder)]) if "FileHistory" in r.path]
+    assert store.db.execute("SELECT COUNT(*) FROM fts").fetchone()[0] == summary.added  # their name rows went too
+    indexer.finish()
+
+
+def test_a_stopped_scan_removes_nothing(tmp_path, folder):
+    store, indexer, _ = make(tmp_path, folder)
+    indexer.sync([str(folder)])
+    before = len(store.files_under([str(folder)]))
+    summary = indexer.sync([str(folder)], should_stop=lambda: True)
+    assert summary.removed == 0 and not summary.crawl.complete
+    assert len(store.files_under([str(folder)])) == before
+    indexer.finish()

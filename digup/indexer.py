@@ -135,12 +135,13 @@ class Indexer:
                 summary.added += 1
             # A root that went away mid-walk (a drive unplugged) looked emptier than it is: keep its rows.
             vanished = [r for r in roots if not os.path.isdir(r)]
-            if not should_stop():
-                for row in existing:
-                    key = row.path.lower()
-                    if key not in seen and key not in moved_from and not any(paths.is_inside(row.path, v) for v in vanished):
-                        self.store.delete(row.id)
-                        summary.removed += 1
+            # Only a walk that reached the end says what's gone: a stopped one saw part of the folders.
+            if report.complete and not should_stop():
+                gone = [row.id for row in existing
+                        if row.path.lower() not in seen and row.path.lower() not in moved_from
+                        and not any(paths.is_inside(row.path, v) for v in vanished)]
+                self.store.delete_many(gone)
+                summary.removed = len(gone)
         return summary
 
     # MARK: Run

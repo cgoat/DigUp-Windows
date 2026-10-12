@@ -30,6 +30,7 @@ class CrawlReport:
     skipped: dict[str, int] = field(default_factory=dict)
     skipped_folders: dict[str, int] = field(default_factory=dict)
     datasets: dict[str, int] = field(default_factory=dict)
+    complete: bool = False  # the walk reached the end (not stopped partway)
 
     def skip(self, reason: str) -> None:
         self.skipped[reason] = self.skipped.get(reason, 0) + 1
@@ -155,6 +156,7 @@ def crawl(roots: list[str], options: IndexOptions, should_stop=lambda: False) ->
                     remaining.append(f)
             kept = remaining
     report.candidates = kept
+    report.complete = True
     return report
 
 

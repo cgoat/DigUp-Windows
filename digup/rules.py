@@ -13,6 +13,11 @@ SKIPPED_FOLDER_NAMES = {
     "$RECYCLE.BIN", "System Volume Information", "AppData", "Windows", "Program Files", "Program Files (x86)",
     "ProgramData", "OneDriveTemp", "Temporary Internet Files", "INetCache",
 }
+# Backups and system folders Windows keeps on data drives: copies of files (File History keeps millions of tiny
+# thumbnails), not your things. A folder whose name starts with "$" is a system one ($OF, $WINDOWS.~BT, $SysReset).
+BACKUP_FOLDER_NAMES = {
+    "FileHistory", "WindowsImageBackup", "Recovery", "Config.Msi", "MSOCache", "PerfLogs", "Windows.old",
+}
 
 PROJECT_MARKERS = [
     ".git", "package.json", "pyproject.toml", "setup.py", "requirements.txt", "Cargo.toml", "go.mod", "pom.xml",
@@ -150,6 +155,8 @@ def skip_reason_for_folder(path: str, excluded: list[str]) -> str | None:
     name = os.path.basename(path)
     if name in SKIPPED_FOLDER_NAMES:
         return "system or developer folder"
+    if name in BACKUP_FOLDER_NAMES or name.startswith("$"):
+        return "backup or system folder"
     if name.startswith(".") or name.endswith(".noindex"):
         return "hidden folder"
     low = path.lower()

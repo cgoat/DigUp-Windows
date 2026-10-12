@@ -11,11 +11,11 @@ import time
 from PySide6.QtCore import (QAbstractListModel, QEvent, QModelIndex, QRect, QSize, Qt, QTimer, QUrl,
                             Signal)
 from PySide6.QtGui import QColor, QCursor, QFont, QFontMetrics, QGuiApplication, QImage, QKeySequence, QPainter, QPainterPath, QPixmap, QShortcut, QTextDocument
-from PySide6.QtWidgets import (QAbstractItemView, QButtonGroup, QFrame, QHBoxLayout, QLabel, QLineEdit, QListView,
-                               QPushButton, QSizePolicy, QStackedWidget, QStyle, QStyledItemDelegate, QTextBrowser,
+from PySide6.QtWidgets import (QAbstractItemView, QButtonGroup, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
+                               QListView, QMenu, QPushButton, QSizePolicy, QStackedWidget, QStyle, QStyledItemDelegate, QTextBrowser,
                                QVBoxLayout, QWidget)
 
-from .. import searchtext
+from .. import rules, searchtext
 from ..model import FileKind
 from ..searcher import SearchHit
 from . import opener, theme
@@ -361,6 +361,14 @@ class SearchPanel(QWidget):
         top.addWidget(icon)
         top.addSpacing(6)
         top.addWidget(self.search, 1)
+        picture = QPushButton("\uEB9F")
+        picture.setObjectName("Gear")
+        picture.setFont(QFont("Segoe Fluent Icons, Segoe MDL2 Assets", 13))
+        picture.setToolTip("Search with a picture: pick one, drop one on this window, or paste one (Ctrl+V)")
+        picture.setCursor(Qt.CursorShape.PointingHandCursor)
+        picture.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        picture.clicked.connect(self.pick_image)
+        top.addWidget(picture)
         gear = QPushButton("")
         gear.setObjectName("Gear")
         gear.setFont(QFont("Segoe Fluent Icons, Segoe MDL2 Assets", 13))
@@ -370,6 +378,29 @@ class SearchPanel(QWidget):
         gear.clicked.connect(self._settings)
         top.addWidget(gear)
         outer.addLayout(top)
+        # Searching with a picture: which one, and a way back to words.
+        self.query_bar = QFrame()
+        self.query_bar.setObjectName("QueryBar")
+        bar = QHBoxLayout(self.query_bar)
+        bar.setContentsMargins(18, 0, 18, 6)
+        self.query_thumb = QLabel()
+        self.query_thumb.setFixedSize(44, 44)
+        self.query_thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.query_label = QLabel()
+        clear = QPushButton("\uE711")
+        clear.setObjectName("Gear")
+        clear.setFont(QFont("Segoe Fluent Icons, Segoe MDL2 Assets", 10))
+        clear.setToolTip("Back to searching with words (Esc)")
+        clear.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        clear.clicked.connect(self.clear_image_query)
+        bar.addWidget(self.query_thumb)
+        bar.addSpacing(8)
+        bar.addWidget(self.query_label, 1)
+        bar.addWidget(clear)
+        self.query_bar.hide()
+        outer.addWidget(self.query_bar)
+        self.image_query = None  # ("image", path, name) or ("similar", hit, name)
+        self.setAcceptDrops(True)
         chips = QHBoxLayout()
         chips.setContentsMargins(18, 2, 18, 10)
         chips.setSpacing(6)
@@ -401,6 +432,8 @@ class SearchPanel(QWidget):
         self.list.doubleClicked.connect(lambda _: self.open_selected())
         self.list.selectionModel().currentChanged.connect(self._current_changed)
         self.list.installEventFilter(self)
+        self.list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.list.customContextMenuRequested.connect(self._context_menu)
         self.empty = QLabel()
         self.empty.setObjectName("Empty")
         self.empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -420,7 +453,7 @@ class SearchPanel(QWidget):
         self.status.setObjectName("Status")
         self.status.setContentsMargins(18, 6, 18, 8)
         outer.addWidget(self.status)
-        self.hints = "Enter open · Ctrl+Enter show in folder · Ctrl+C copy file · Ctrl+Space play · Tab filter · Esc clear"
+        self.hints = "Enter open · Ctrl+Enter show in folder · Ctrl+C copy file · Ctrl+Shift+F find similar · Ctrl+Space play · Tab filter · Esc clear"
         self.engine_line = ""
         self._set_status()
 
@@ -428,10 +461,11 @@ class SearchPanel(QWidget):
         self.debounce.setSingleShot(True)
         self.debounce.setInterval(140)
         self.debounce.timeout.connect(self._search_now)
-        self.search.textChanged.connect(lambda _: self.debounce.start())
+        self.search.textChanged.connect(self._typed)
         service.results.connect(self._show_results)
         for keys, action in (("Ctrl+Return", self.reveal_selected), ("Ctrl+Enter", self.reveal_selected),
-                             ("Ctrl+,", self._settings), ("Escape", self._escape)):
+                             ("Ctrl+,", self._settings), ("Escape", self._escape),
+                             ("Ctrl+Shift+F", self.find_similar)):
             QShortcut(QKeySequence(keys), self, action)
         self._show_empty("Search your pictures, PDFs, documents, recordings and videos by what's in them.\n\n"
                          "Try “a dog on the beach”, “the clause about pets in the lease”, or “code: retry with backoff”.")
@@ -488,7 +522,9 @@ class SearchPanel(QWidget):
         self.hide()
 
     def _escape(self) -> None:
-        if self.search.text():
+        if self.image_query:
+            self.clear_image_query()
+        elif self.search.text():
             self.search.clear()
         self.search.setFocus()
 
@@ -499,9 +535,19 @@ class SearchPanel(QWidget):
 
     def _filter(self, index: int) -> None:
         self.kinds = FILTERS[index][1]
-        self._search_now()
+        if self.image_query:
+            self._run_image_query()
+        else:
+            self._search_now()
+
+    def _typed(self, _text: str) -> None:
+        if self.image_query and self.search.text().strip():
+            self._end_image_query()  # typing goes back to words
+        self.debounce.start()
 
     def _search_now(self) -> None:
+        if self.image_query:
+            return
         text = self.search.text().strip()
         self.last_query = text
         if not text:
@@ -517,6 +563,10 @@ class SearchPanel(QWidget):
         self.words = results.words
         previous = self.current_hit()
         self.model.set(results.hits, results.strong)
+        if not results.hits and self.image_query:
+            self._show_empty("Nothing in your folders looks like that.")
+            self.preview.show_hit(None)
+            return
         if not results.hits:
             self._show_empty("Looking…" if not results.final else "Nothing found.\nTry describing it another way.")
             self.preview.show_hit(None)
@@ -581,6 +631,120 @@ class SearchPanel(QWidget):
             opener.copy_file(hit.path)
             self._set_status(f"copied {os.path.basename(hit.path)}: paste it anywhere")
 
+    # MARK: Searching with a picture
+
+    def pick_image(self) -> None:
+        start = os.path.join(os.path.expanduser("~"), "Pictures")
+        exts = " ".join(f"*.{e}" for e in sorted(rules.IMAGE_EXTENSIONS))
+        path, _ = QFileDialog.getOpenFileName(self, "Search with a picture", start, f"Pictures ({exts});;All files (*)")
+        if path:
+            self.search_with_image(os.path.normpath(path))
+
+    def search_with_image(self, path: str, name: str | None = None) -> None:
+        """Results that look like the picture at `path` (indexed or not)."""
+        self._start_image_query(("image", path, name or os.path.basename(path)), QImage(path))
+
+    def find_similar(self) -> None:
+        """Results like the selected one, from the vector the index holds for it."""
+        hit = self.current_hit()
+        if hit is not None:
+            self._start_image_query(("similar", hit, os.path.basename(hit.path)), self.thumbs.get(hit, 160))
+
+    def _start_image_query(self, query, image: QImage | None) -> None:
+        self.image_query = query
+        self.search.blockSignals(True)
+        self.search.clear()
+        self.search.blockSignals(False)
+        self.search.setPlaceholderText("Type to search with words again…")
+        kind, target, name = query
+        what = ("pictures, screenshots, video moments and pages that look like it" if kind == "image"
+                or getattr(target, "kind", None) not in (FileKind.DOC, FileKind.CODE, FileKind.AUDIO)
+                else "files about the same thing")
+        self.query_label.setText(f"<b>Looking for things like</b> {html.escape(name)}"
+                                 f"<br><span style='color:{self.colors.muted}'>{what}</span>")
+        self.query_thumb.clear()
+        if image is not None and not image.isNull():
+            self.query_thumb.setPixmap(QPixmap.fromImage(image).scaled(
+                44, 44, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        else:
+            self.query_thumb.setFont(QFont("Segoe Fluent Icons, Segoe MDL2 Assets", 16))
+            self.query_thumb.setText(KIND_GLYPH.get(getattr(target, "kind", None), "\uEB9F"))
+        self.query_bar.show()
+        self._run_image_query()
+
+    def _run_image_query(self) -> None:
+        kind, target, _ = self.image_query
+        key = f"{kind}:{target if kind == 'image' else target.path}"
+        self.last_query = key
+        self.words = []
+        self.model.set([], 0)
+        self.preview.show_hit(None)
+        self._show_empty("Looking at the picture…" if kind == "image" else "Looking…")
+        if kind == "image":
+            self.service.search_image(target, self.kinds, key)
+        else:
+            self.service.search_similar(target, self.kinds, key)
+
+    def _end_image_query(self) -> None:
+        self.image_query = None
+        self.query_bar.hide()
+        self.search.setPlaceholderText("Describe what you're looking for…")
+
+    def clear_image_query(self) -> None:
+        self._end_image_query()
+        self.last_query = ""
+        self.model.set([], 0)
+        self.preview.show_hit(None)
+        self._show_empty("Search your pictures, PDFs, documents, recordings and videos by what's in them.")
+        self.search.setFocus()
+
+    @staticmethod
+    def _image_paths(mime) -> list[str]:
+        return [u.toLocalFile() for u in mime.urls()
+                if u.isLocalFile() and rules.ext_of(u.toLocalFile()) in rules.IMAGE_EXTENSIONS]
+
+    def _image_from_mime(self, mime) -> bool:
+        """A picture dropped or pasted: a file, or image data (a browser, the Snipping Tool)."""
+        files = self._image_paths(mime)
+        if files:
+            self.search_with_image(os.path.normpath(files[0]))
+            return True
+        if mime.hasImage():
+            image = QImage(mime.imageData())
+            if image.isNull():
+                return False
+            import tempfile
+
+            folder = os.path.join(tempfile.gettempdir(), "DigUp-query")
+            os.makedirs(folder, exist_ok=True)
+            path = os.path.join(folder, f"pasted-{int(time.time() * 1000)}.png")
+            image.save(path)
+            self.search_with_image(path, "the pasted picture")
+            return True
+        return False
+
+    def dragEnterEvent(self, event) -> None:
+        mime = event.mimeData()
+        if self._image_paths(mime) or mime.hasImage():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event) -> None:
+        if self._image_from_mime(event.mimeData()):
+            event.acceptProposedAction()
+            self.show_panel()
+
+    def _context_menu(self, pos) -> None:
+        index = self.list.indexAt(pos)
+        if not index.isValid():
+            return
+        self.list.setCurrentIndex(index)
+        menu = QMenu(self)
+        menu.addAction("Open", self.open_selected)
+        menu.addAction("Find similar\tCtrl+Shift+F", self.find_similar)
+        menu.addAction("Show in folder\tCtrl+Enter", self.reveal_selected)
+        menu.addAction("Copy file\tCtrl+C", self.copy_selected)
+        menu.exec(self.list.viewport().mapToGlobal(pos))
+
     def _move(self, step: int) -> None:
         count = self.model.rowCount()
         if not count:
@@ -603,6 +767,10 @@ class SearchPanel(QWidget):
                 else:
                     self.open_selected()
                 return True
+            if key == Qt.Key.Key_V and mods & Qt.KeyboardModifier.ControlModifier and obj is self.search:
+                mime = QGuiApplication.clipboard().mimeData()
+                if mime is not None and (mime.hasImage() or self._image_paths(mime)) and self._image_from_mime(mime):
+                    return True
             if key == Qt.Key.Key_C and mods & Qt.KeyboardModifier.ControlModifier and not self.search.hasSelectedText():
                 self.copy_selected()
                 return True

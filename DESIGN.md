@@ -68,6 +68,11 @@ modality's mean, over the standard deviation of all), a file qualifies by standi
 half the query's words, and the score is meaning z + a word-coverage bonus + 1 for a kind the query names. Codes and
 numbers weigh words double. Results below half the top score fold under "Weaker matches".
 
+**Searching with a picture** uses the same space: an image query is embedded by the full model (a second worker,
+started on first use and stopped with the query encoder) at the screenshots' budget (280), and searched by meaning
+alone. **Find similar** needs no model: it searches with the vector the index already holds for the result (its
+segment's, else the file's picture, else any of its vectors). The query's own file is left out of the results.
+
 The app shows keyword matches as you type (prefix match on the last word), then the full results once the query
 encoder returns the vector. The encoder is a text-only worker (~300 MB) started when the panel opens and stopped five
 minutes after the last search; vectors are loaded on the first meaning search and released with it.

@@ -349,6 +349,22 @@ class Searcher:
         line = codeextract.first_line(words_ if ident is None else [name.lower()], text, first)
         return segment, (float(line) if line else None)
 
+    def vector_of(self, segment_id: int, path: str | None = None) -> list[float] | None:
+        """A stored vector to search with ("find similar"): the segment's own, else the file's picture (its image,
+        a video's first frame, a scanned page), else any vector of the file."""
+        db = self.store.db
+        row = db.execute("SELECT vec FROM segments WHERE id = ?", (segment_id,)).fetchone()
+        blob = row[0] if row else None
+        if blob is None and path is not None:
+            row = db.execute(
+                "SELECT s.vec FROM segments s JOIN files f ON f.id = s.file WHERE f.path = ? AND s.vec IS NOT NULL "
+                "ORDER BY CASE s.modality WHEN 'image' THEN 0 WHEN 'text' THEN 1 ELSE 2 END, s.loc LIMIT 1",
+                (path,)).fetchone()
+            blob = row[0] if row else None
+        if blob is None or len(blob) != DIM * 2:
+            return None
+        return np.frombuffer(blob, dtype=np.float16).astype(np.float32).tolist()
+
     def text_of_segment(self, id: int) -> str | None:
         row = self.store.db.execute("SELECT coalesce(original, body) FROM fts WHERE rowid = ?", (id,)).fetchone()
         return row[0] if row else None

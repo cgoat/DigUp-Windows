@@ -112,6 +112,11 @@ def cmd_index(args) -> int:
 def cmd_search(args) -> int:
     from .searcher import Searcher
 
+    if args.image:
+        return search_image(args)
+    if not args.query:
+        print("give some words, or --image PATH", file=sys.stderr)
+        return 2
     text = " ".join(args.query)
     code_text = CodeQuery.text_of(text)
     code = code_text is not None
@@ -160,6 +165,42 @@ def cmd_search(args) -> int:
         print("nothing found")
     if args.verbose:
         print(f"(searched in {(time.time() - started) * 1000:.0f} ms)")
+    return 0
+
+
+def search_image(args) -> int:
+    """Pictures, video moments and pages that look like an image (any image, indexed or not)."""
+    from .searcher import Searcher, strong_count
+
+    path = paths.normalize(args.image)
+    if args.in_process:
+        from .llama import LlamaEmbedder
+
+        embedder = LlamaEmbedder(text_only=False, backend=args.backend)
+    else:
+        from .worker import EmbeddingWorker
+
+        embedder = EmbeddingWorker(text_only=False)
+    result = embedder.embed_images([path], 280)[0]
+    embedder.close()
+    if result.vector is None:
+        print(f"can't read {path}: {result.error}", file=sys.stderr)
+        return 1
+    kinds = {FileKind(k) for k in args.kind} if args.kind else None
+    hits = [h for h in Searcher(_store(False)).search("", result.vector, kinds=kinds, limit=args.limit + 1)
+            if h.path.lower() != path.lower()][:args.limit]
+    strong = strong_count(hits)
+    for i, hit in enumerate(hits):
+        if i == strong:
+            print("  -- weaker matches --")
+        where = ""
+        if hit.loc is not None and hit.kind in (FileKind.AUDIO, FileKind.VIDEO):
+            where = f" @ {int(hit.loc // 60)}:{int(hit.loc % 60):02d}"
+        elif hit.loc is not None and hit.kind == FileKind.PDF:
+            where = f" p.{int(hit.loc)}"
+        print(f"{i + 1:2}. {hit.score:5.2f} [{hit.kind.value}] {hit.path}{where}  z={hit.z:.1f}")
+    if not hits:
+        print("nothing looks like that")
     return 0
 
 
@@ -226,8 +267,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--in-process", action="store_true", help="run the model in this process")
     p.set_defaults(func=cmd_index)
 
-    p = sub.add_parser("search", help="search (start with 'code:' for code)")
-    p.add_argument("query", nargs="+")
+    p = sub.add_parser("search", help="search with words (start with 'code:' for code) or --image PATH")
+    p.add_argument("query", nargs="*")
+    p.add_argument("--image", help="search with a picture: things that look like it")
     p.add_argument("--kind", action="append", choices=[k.value for k in FileKind])
     p.add_argument("--limit", type=int, default=20)
     p.add_argument("-v", "--verbose", action="store_true")

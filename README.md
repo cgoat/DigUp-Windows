@@ -28,6 +28,9 @@ own words, and it finds the match, whatever kind of file it is. All of it happen
 - a search in English finds a note written in Bengali, Arabic or any of the model's 100+ languages, and the other way
   around
 - "code: retry a failed call with backoff" finds the function in your projects, if you turn on code search
+- **search with a picture**: drop an image on the window, paste one (Ctrl+V) or pick one with the 🖼 button, and DigUp
+  finds the photos, screenshots, video moments and scanned pages that look like it. Right-click any result →
+  **Find similar** does the same from the result (instantly: its vector is already in the index)
 
 Exact words count too: invoice numbers, error codes and names are matched as written, in file names, document text and
 the text inside screenshots, so a search gets both the meaning and the exact string.
@@ -55,6 +58,8 @@ telemetry.
 | Enter | Opens the result: videos and recordings at the moment, PDFs at the page, code in your editor at the line |
 | Ctrl+Enter | Shows it in File Explorer |
 | Ctrl+C | Copies the file, to paste anywhere |
+| Ctrl+Shift+F | Finds results like the selected one (also on the right-click menu) |
+| Ctrl+V | Pasting a picture searches with it; so does dropping one on the window |
 | Ctrl+Space | Plays the video or recording in the preview, from the moment it matched |
 | Tab | Narrows to pictures, screenshots, PDFs, documents, audio or video |
 | Esc | Clears the search |
@@ -132,8 +137,8 @@ uv venv --python 3.12 .venv; uv pip install --python .venv\Scripts\python.exe -e
 ```
 
 `scripts\build.ps1` builds `dist\DigUp\` (`DigUp.exe` and `digup-cli.exe`) with PyInstaller, and an installer with
-Inno Setup 6 when it's installed. There's also a command-line tool that indexes, searches and reports
-(`digup --help`), and `scripts\make_testbed.py` builds a folder of test files to try it on.
+Inno Setup 6 when it's installed. There's also a command-line tool that indexes, searches (with words, or `--image PATH`)
+and reports (`digup --help`), and `scripts\make_testbed.py` builds a folder of test files to try it on.
 
 ## FAQ
 

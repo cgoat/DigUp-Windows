@@ -131,3 +131,25 @@ def test_moves_keep_vectors_in_store(tmp_path):
     hits = Searcher(store).search("K7Q2LM", None)
     assert [h.path for h in hits] == ["C:\\e\\renamed.png"]
     assert store.counts()["vectors"] == 1
+
+
+def test_find_similar_uses_the_stored_vector(tmp_path):
+    store = IndexStore(tmp_path)
+    ids = {}
+    for name, words in (("beach.jpg", "dog beach sand sea"), ("beach2.jpg", "dog beach sand waves"),
+                        ("city.jpg", "night city lights towers")):
+        ids[name] = store.insert(Candidate(rf"C:\p\{name}", FileKind.IMAGE, 1, 1.0, len(ids) + 1, 1))
+        store.add_segment(ids[name], SegmentKind.IMAGE, Modality.IMAGE, vector=vector_for(words))
+    # Filler so the meaning scale has a spread, as a real index does.
+    for i in range(40):
+        f = store.insert(Candidate(rf"C:\p\other{i}.jpg", FileKind.IMAGE, 1, 1.0, 100 + i, 1))
+        store.add_segment(f, SegmentKind.IMAGE, Modality.IMAGE, vector=vector_for(f"filler{i} thing{i}"))
+    searcher = Searcher(store)
+    seg = store.db.execute("SELECT id FROM segments WHERE file = ? AND kind = 'image'", (ids["beach.jpg"],)).fetchone()[0]
+    vector = searcher.vector_of(seg)
+    assert vector is not None and abs(np.linalg.norm(vector) - 1) < 1e-2
+    # A keyword-only segment (the name row) has no vector: the file's picture is used instead.
+    name_row = store.db.execute("SELECT id FROM segments WHERE file = ? AND kind = 'name'", (ids["beach.jpg"],)).fetchone()[0]
+    assert searcher.vector_of(name_row, r"C:\p\beach.jpg") is not None
+    hits = [h.path for h in searcher.search("", vector) if h.path != r"C:\p\beach.jpg"]
+    assert hits[0] == r"C:\p\beach2.jpg" and r"C:\p\city.jpg" not in hits

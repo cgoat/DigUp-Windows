@@ -1,0 +1,43 @@
+[project]
+name = "digup-windows"
+version = "0.1.0"
+description = "DigUp for Windows: search the files on your PC by what's in them, with EmbeddingGemma 2 on llama.cpp"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "numpy>=2.0",
+    "pillow>=11.0",
+    "pillow-heif>=0.18",          # HEIC/HEIF photos from iPhones
+    "pypdfium2>=4.30",            # PDF text and page rendering
+    "imageio-ffmpeg>=0.5",        # a bundled ffmpeg.exe: audio windows and video frames
+    "watchdog>=5.0",              # new files become searchable seconds after they land
+    "PySide6-Essentials>=6.8",    # tray app, search panel, settings
+    "PySide6-Addons>=6.8",        # QtMultimedia: previews that play at the moment
+    "winrt-runtime>=2.3; sys_platform == 'win32'",              # Windows.Media.Ocr for screenshot text
+    "winrt-Windows.Media.Ocr>=2.3; sys_platform == 'win32'",
+    "winrt-Windows.Graphics.Imaging>=2.3; sys_platform == 'win32'",
+    "winrt-Windows.Storage.Streams>=2.3; sys_platform == 'win32'",
+    "winrt-Windows.Foundation>=2.3; sys_platform == 'win32'",
+    "winrt-Windows.Foundation.Collections>=2.3; sys_platform == 'win32'",
+    "winrt-Windows.Globalization>=2.3; sys_platform == 'win32'",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pyinstaller>=6.10"]
+
+[project.scripts]
+digup = "digup.cli:main"
+
+[project.gui-scripts]
+digup-app = "digup.app.main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["digup"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

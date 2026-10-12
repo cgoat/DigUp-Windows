@@ -1,0 +1,354 @@
+"""Hybrid search: meaning (EmbeddingGemma's vectors) + words (FTS5).
+
+Meaning is the model's cosine similarity, put on one scale per query (`meaning`): every vector is scored anyway, so the
+distribution comes for free, and only segments that stand out (`z_gate`) count as meaning matches. That also gives an
+honest "nothing found". Words rescue what a vector can't hold exactly: codes, IDs and names.
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+
+import numpy as np
+
+from . import codeextract, searchtext
+from .model import DIM, FileKind, IndexOptions, Modality, SegmentKind
+from .store import IndexStore
+
+
+@dataclass
+class SearchHit:
+    path: str
+    kind: FileKind
+    score: float
+    z: float | None
+    cosine: float | None
+    keyword_rank: int | None
+    segment: SegmentKind
+    segment_id: int
+    loc: float | None  # PDF page, seconds into audio/video, first line of code
+    loc_end: float | None
+    excerpt: str | None
+    modified: float
+    size: int
+    info: dict = field(default_factory=dict)
+    focus: float | None = None  # code: the line to open at
+
+
+STOPWORDS = {
+    "a", "an", "the", "of", "in", "on", "at", "to", "for", "with", "and", "or", "my", "me", "that", "this",
+    "these", "those", "from", "about", "where", "what", "which", "who", "when", "is", "was", "are", "were", "be",
+    "it", "its", "some", "any", "find", "show", "file", "files", "photo", "photos", "picture", "image", "images",
+    "screenshot", "screenshots", "video", "videos", "pdf", "document", "documents", "recording",
+    "এবং", "ও", "এই", "সেই", "একটি", "আমার", "থেকে", "জন্য", "সাথে", "মধ্যে", "কোথায়", "কোন", "কী", "কি", "যে",
+    "ছবি", "স্ক্রিনশট", "ভিডিও", "ফাইল", "পিডিএফ",
+    "في", "من", "على", "الى", "عن", "مع", "هذا", "هذه", "ذلك", "التي", "الذي", "اين", "ما",
+    "صورة", "صور", "لقطة", "شاشة", "فيديو", "ملف", "مستند",
+}
+
+KIND_WORDS = {
+    "screenshot": FileKind.SCREENSHOT, "screenshots": FileKind.SCREENSHOT, "photo": FileKind.IMAGE,
+    "photos": FileKind.IMAGE, "picture": FileKind.IMAGE, "pictures": FileKind.IMAGE, "image": FileKind.IMAGE,
+    "images": FileKind.IMAGE, "pdf": FileKind.PDF, "pdfs": FileKind.PDF, "paper": FileKind.PDF,
+    "papers": FileKind.PDF, "document": FileKind.DOC, "documents": FileKind.DOC, "note": FileKind.DOC,
+    "notes": FileKind.DOC, "video": FileKind.VIDEO, "videos": FileKind.VIDEO, "clip": FileKind.VIDEO,
+    "movie": FileKind.VIDEO, "audio": FileKind.AUDIO, "song": FileKind.AUDIO, "podcast": FileKind.AUDIO,
+    "voice": FileKind.AUDIO, "sound": FileKind.AUDIO,
+    "স্ক্রিনশট": FileKind.SCREENSHOT, "ছবি": FileKind.IMAGE, "পিডিএফ": FileKind.PDF, "নোট": FileKind.DOC,
+    "ভিডিও": FileKind.VIDEO, "অডিও": FileKind.AUDIO, "গান": FileKind.AUDIO, "রেকর্ডিং": FileKind.AUDIO,
+    "لقطة": FileKind.SCREENSHOT, "صورة": FileKind.IMAGE, "صور": FileKind.IMAGE, "مستند": FileKind.DOC,
+    "ملاحظات": FileKind.DOC, "فيديو": FileKind.VIDEO, "مقطع": FileKind.VIDEO, "صوت": FileKind.AUDIO,
+    "تسجيل": FileKind.AUDIO, "اغنية": FileKind.AUDIO,
+}
+
+WORD_WEIGHT = 2.0
+CODE_WORD_WEIGHT = 1.0
+
+
+def terms(text: str) -> list[str]:
+    """The content words of a query, normalized as keyword search keeps its text; kind words and stopwords dropped."""
+    seen: set[str] = set()
+    out = []
+    for word in searchtext.split_words(searchtext.normalized(text).lower()):
+        if len(word) >= 2 and word not in STOPWORDS and word not in seen:
+            seen.add(word)
+            out.append(word)
+    return out
+
+
+def patterns(words: list[str], prefix_last: bool) -> list[str]:
+    return [
+        f'"{w}"' + ("*" if (prefix_last and i == len(words) - 1) or searchtext.inflects(w) else "")
+        for i, w in enumerate(words)
+    ]
+
+
+def fts_query(text: str, prefix_last: bool = False) -> str | None:
+    words = terms(text)
+    return " OR ".join(patterns(words, prefix_last)) if words else None
+
+
+def is_lookup(words: list[str]) -> bool:
+    """Codes, IDs and long numbers mean nothing to an embedding: such a query weighs words double, meaning half."""
+    return bool(words) and all(
+        any(c.isdigit() for c in w) and (any(c.isalpha() for c in w) or len(w) >= 4) for w in words
+    )
+
+
+def kind_hints(text: str) -> set[FileKind]:
+    out = set()
+    for word in searchtext.split_words(searchtext.normalized(text).lower()):
+        if word in KIND_WORDS:
+            out.add(KIND_WORDS[word])
+            continue
+        for key, kind in KIND_WORDS.items():
+            if searchtext.inflects(key) and len(key) >= 3 and word.startswith(key):
+                out.add(kind)
+                break
+    return out
+
+
+def strong_count(hits: list[SearchHit], ratio: float = 0.5) -> int:
+    """How many hits are strong (at least `ratio` x the top score); the rest fold under "weaker matches"."""
+    if not hits or hits[0].score <= 0:
+        return len(hits)
+    top = hits[0].score
+    n = 0
+    for h in hits:
+        if h.score < top * ratio:
+            break
+        n += 1
+    return n
+
+
+def meaning(scores: np.ndarray, modality: np.ndarray, sets_scale: np.ndarray | None = None) -> np.ndarray:
+    """Each vector's cosine minus its modality's average, in standard deviations of all of them together. The scale
+    comes from the vectors in `sets_scale` (later pages of long files are scored on it but don't move it)."""
+    use = np.ones(len(scores), dtype=bool) if sets_scale is None else sets_scale
+    s = scores.astype(np.float64)
+    overall = s[use].mean() if use.any() else 0.0
+    means = np.full(len(s), overall)
+    for m in np.unique(modality):
+        group = (modality == m) & use
+        if group.sum() >= 20:
+            means[modality == m] = s[group].mean()
+    centered = s - means
+    base = centered[use] if use.any() else centered
+    mean = base.mean() if base.size else 0.0
+    deviation = max(float(np.sqrt(((base - mean) ** 2).mean())) if base.size else 0.0, 0.02)
+    return (centered - mean) / deviation
+
+
+class Searcher:
+    def __init__(self, store: IndexStore, load_vectors: bool = True):
+        self.store = store
+        self.matrix: np.ndarray | None = None  # rows x 768 float16
+        self.row_file = np.zeros(0, dtype=np.int64)
+        self.row_segment = np.zeros(0, dtype=np.int64)
+        self.row_modality = np.zeros(0, dtype="<U5")
+        self.row_sets_scale = np.zeros(0, dtype=bool)
+        self.file_kind: dict[int, FileKind] = {}
+        self.vector_source: str | None = None
+        self.vectors_loaded = False
+        if load_vectors:
+            self.reload()
+        else:
+            self._reload_files()
+
+    @property
+    def is_code(self) -> bool:
+        return self.store.is_code
+
+    @property
+    def vector_count(self) -> int:
+        return len(self.row_file)
+
+    def reload(self) -> None:
+        self.release_vectors()
+        self._reload_files()
+        steps = IndexOptions()
+        rows = self.store.db.execute(
+            "SELECT s.id, s.file, s.modality, s.vec, s.kind, s.loc, f.kind, "
+            "CAST(json_extract(f.info, '$.pages') AS INTEGER) "
+            "FROM segments s JOIN files f ON f.id = s.file WHERE s.vec IS NOT NULL ORDER BY s.id"
+        ).fetchall()
+        rows = [r for r in rows if r[3] is not None and len(r[3]) == DIM * 2]
+        if rows:
+            self.matrix = np.frombuffer(b"".join(r[3] for r in rows), dtype=np.float16).reshape(len(rows), DIM)
+            self.row_segment = np.array([r[0] for r in rows], dtype=np.int64)
+            self.row_file = np.array([r[1] for r in rows], dtype=np.int64)
+            self.row_modality = np.array([r[2] for r in rows])
+            later = []
+            for r in rows:
+                kind, place = r[4], int(r[5] or 0)
+                if r[6] == "pdf":
+                    later.append(kind != "chunk" and (r[7] or 0) > steps.big_pdf_pages and place > steps.pdf_step)
+                else:
+                    later.append(kind == "chunk" and place > steps.doc_step)
+            self.row_sets_scale = ~np.array(later, dtype=bool)
+        self.vectors_loaded = True
+
+    def release_vectors(self) -> None:
+        self.matrix = None
+        self.row_file = np.zeros(0, dtype=np.int64)
+        self.row_segment = np.zeros(0, dtype=np.int64)
+        self.row_modality = np.zeros(0, dtype="<U5")
+        self.row_sets_scale = np.zeros(0, dtype=bool)
+        self.vectors_loaded = False
+
+    def _reload_files(self) -> None:
+        self.file_kind = {r[0]: FileKind(r[1]) for r in self.store.db.execute("SELECT id, kind FROM files")}
+        self.vector_source = self.store.meta("vector_source")
+
+    def score(self, query) -> np.ndarray:
+        """Cosine similarity with every stored vector (all are L2-normalized), a block of rows at a time."""
+        if self.matrix is None:
+            return np.zeros(0, dtype=np.float32)
+        q = np.asarray(query, dtype=np.float32)
+        out = np.empty(len(self.matrix), dtype=np.float32)
+        for start in range(0, len(self.matrix), 8192):
+            out[start:start + 8192] = self.matrix[start:start + 8192].astype(np.float32) @ q
+        return out
+
+    def search(self, text: str, query_vector=None, kinds: set[FileKind] | None = None, limit: int = 20,
+               z_gate: float = 2.0, word_weight: float | None = None, prefix_last: bool = False) -> list[SearchHit]:
+        word_weight = word_weight if word_weight is not None else (CODE_WORD_WEIGHT if self.is_code else WORD_WEIGHT)
+        if query_vector is not None and not self.vectors_loaded:
+            self.reload()
+        file_kind = self.file_kind
+
+        def allowed(file: int) -> bool:
+            return kinds is None or file_kind.get(file) in kinds
+
+        # Meaning: score every vector on this query's scale, keep each file's best segment.
+        best: dict[int, tuple[float, float, int]] = {}
+        if query_vector is not None and len(query_vector) == DIM and len(self.row_file):
+            scores = self.score(query_vector)
+            z = meaning(scores, self.row_modality, self.row_sets_scale)
+            order = np.argsort(-z, kind="stable")
+            for row in order:
+                file = int(self.row_file[row])
+                if file in best or not allowed(file):
+                    continue
+                best[file] = (float(z[row]), float(scores[row]), int(row))
+                if z[row] < z_gate - 4:
+                    break  # far below the gate: neither scored nor pointed at
+
+        # Words: FTS5 with Porter stemming over names, folders, OCR, page and document text.
+        words_ = terms(text)
+        ident = codeextract.identifier(text) if self.is_code else None
+        word_hits: list[tuple[int, int, str | None]] = []
+        coverage: dict[int, float] = {}
+        pats = [codeextract.phrase(ident)] if ident else patterns(words_, prefix_last)
+        db = self.store.db
+        if pats:
+            seen: set[int] = set()
+            try:
+                rows = db.execute(
+                    "SELECT s.file, s.id, snippet(fts, 1, '«', '»', '…', 12), fts.original FROM fts "
+                    "JOIN segments s ON s.id = fts.rowid WHERE fts MATCH ? ORDER BY bm25(fts, 3.0, 1.0) LIMIT 1000",
+                    (" OR ".join(pats),),
+                ).fetchall()
+            except Exception:
+                rows = []
+            for file, seg, snip, original in rows:
+                if len(word_hits) >= 100 or not allowed(file) or file in seen:
+                    continue
+                seen.add(file)
+                quoted = searchtext.snippet(original, words_) if original else None
+                word_hits.append((file, seg, quoted or snip))
+            if word_hits:
+                files = ",".join(str(f) for f, _, _ in word_hits)
+                for pattern in pats:
+                    try:
+                        for (file,) in db.execute(
+                            "SELECT DISTINCT s.file FROM fts JOIN segments s ON s.id = fts.rowid "
+                            f"WHERE fts MATCH ? AND s.file IN ({files})", (pattern,)
+                        ):
+                            coverage[file] = coverage.get(file, 0) + 1 / len(pats)
+                    except Exception:
+                        pass
+
+        # A file qualifies by standing out in meaning, or by containing at least half of the query's words.
+        lookup = is_lookup(words_) or ident is not None
+        meaning_weight, words_weight = (0.5, word_weight * 2) if lookup else (1.0, word_weight)
+        hinted = kind_hints(text)
+        candidates = {f for f, v in best.items() if v[0] >= z_gate} | {f for f, s in coverage.items() if s >= 0.5}
+        scored: dict[int, float] = {}
+        for file in candidates:
+            s = meaning_weight * max(best[file][0] if file in best else 0, 0) + words_weight * coverage.get(file, 0) ** 1.5
+            if file_kind.get(file) in hinted:
+                s += 1
+            scored[file] = s
+
+        word_rank: dict[int, tuple[int, tuple[int, int, str | None]]] = {}
+        for i, hit in enumerate(word_hits):
+            word_rank.setdefault(hit[0], (i + 1, hit))
+        hits: list[SearchHit] = []
+        for file, s in sorted(scored.items(), key=lambda kv: (-kv[1], kv[0]))[:limit]:
+            rank = len(hits)
+            semantic = best.get(file)
+            keyword = word_rank.get(file)
+            use_meaning = semantic is not None and (semantic[0] >= z_gate or keyword is None)
+            if use_meaning:
+                segment_id = int(self.row_segment[semantic[2]])
+            elif keyword:
+                segment_id = keyword[1][1]
+            else:
+                continue
+            focus = None
+            if self.is_code:
+                segment_id, focus = self._code_place(file, segment_id, ident if rank < 10 else None, text, words_,
+                                                     (keyword is not None and keyword[1][1] == segment_id) or ident is not None)
+            row = db.execute("SELECT path, kind, mtime, size, info FROM files WHERE id = ?", (file,)).fetchone()
+            if not row:
+                continue
+            seg = db.execute("SELECT kind, loc, loc_end, excerpt FROM segments WHERE id = ?", (segment_id,)).fetchone()
+            seg_kind, loc, loc_end, stored = (seg if seg else ("name", None, None, None))
+            snippet = None
+            if keyword and keyword[1][1] == segment_id and keyword[1][2] and "«" in keyword[1][2]:
+                snippet = searchtext.excerpt(keyword[1][2], 400)
+            if snippet is None and stored is None and loc is None and keyword and keyword[1][2] and "«" in keyword[1][2]:
+                matched = db.execute("SELECT kind FROM segments WHERE id = ?", (keyword[1][1],)).fetchone()
+                if matched and matched[0] != "name":
+                    snippet = searchtext.excerpt(keyword[1][2], 400)
+            hits.append(SearchHit(
+                path=row[0], kind=FileKind(row[1]), score=s, z=semantic[0] if semantic else None,
+                cosine=semantic[1] if semantic else None, keyword_rank=keyword[0] if keyword else None,
+                segment=SegmentKind(seg_kind), segment_id=segment_id, loc=loc, loc_end=loc_end,
+                excerpt=snippet or stored, modified=row[2], size=row[3], info=json.loads(row[4]) if row[4] else {},
+                focus=focus,
+            ))
+        return hits
+
+    def _code_place(self, file: int, segment: int, ident: list[str] | None, query: str, words_: list[str],
+                    words_here: bool) -> tuple[int, float | None]:
+        name = query.strip().replace("()", "")
+        db = self.store.db
+        if ident:
+            best = None
+            for seg_id, loc, text in db.execute(
+                "SELECT s.id, s.loc, coalesce(fts.original, fts.body) FROM fts JOIN segments s ON s.id = fts.rowid "
+                "WHERE fts MATCH ? AND s.file = ? ORDER BY s.loc LIMIT 300", (codeextract.phrase(ident), file)
+            ):
+                if best and best[2] >= 2:
+                    break
+                found = codeextract.definition(name, text or "", int(loc or 1))
+                if found and found[1] > (best[2] if best else 0):
+                    best = (seg_id, found[0], found[1])
+            if best:
+                return best[0], float(best[1])
+        if not (words_here or ident):
+            return segment, None
+        text = self.text_of_segment(segment)
+        if not text:
+            return segment, None
+        row = db.execute("SELECT loc FROM segments WHERE id = ?", (segment,)).fetchone()
+        first = int(row[0] or 1) if row else 1
+        line = codeextract.first_line(words_ if ident is None else [name.lower()], text, first)
+        return segment, (float(line) if line else None)
+
+    def text_of_segment(self, id: int) -> str | None:
+        row = self.store.db.execute("SELECT coalesce(original, body) FROM fts WHERE rowid = ?", (id,)).fetchone()
+        return row[0] if row else None

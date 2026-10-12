@@ -18,7 +18,7 @@ def main() -> None:
     query, out = sys.argv[1], sys.argv[2]
     row = int(sys.argv[sys.argv.index("--row") + 1]) if "--row" in sys.argv else 0
     app = QApplication(sys.argv)
-    app.setStyleSheet(theme.stylesheet(theme.palette()))
+    theme.apply(app)
     service = QueryService()
     panel = SearchPanel(service, Settings.load())
     panel.show_panel()

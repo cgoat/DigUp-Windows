@@ -168,3 +168,17 @@ def decorate(widget, dark: bool, frameless: bool = False) -> None:
             ctypes.windll.dwmapi.DwmExtendFrameIntoClientArea(ctypes.c_void_p(hwnd), ctypes.byref(margins))
         except Exception:
             pass
+
+
+def apply(app) -> Palette:
+    """The stylesheet, and the palette's accent (checkboxes, focus rings, selections) in DigUp's amber."""
+    from PySide6.QtGui import QPalette
+
+    p = palette()
+    app.setStyleSheet(stylesheet(p))
+    qp = app.palette()
+    for role in (QPalette.ColorRole.Highlight, QPalette.ColorRole.Accent):
+        qp.setColor(role, QColor(p.accent))
+    qp.setColor(QPalette.ColorRole.HighlightedText, QColor(p.accent_text))
+    app.setPalette(qp)
+    return p

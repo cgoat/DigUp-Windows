@@ -46,6 +46,7 @@ class Onboarding(QWidget):
         self.setWindowTitle("Welcome to DigUp")
         self.setWindowIcon(theme.app_icon())
         self.resize(620, 600)
+        self._stop = False  # before the first estimate starts
         self.bridge = Bridge()
         self.bridge.progress.connect(self._progress)
         self.bridge.finished.connect(self._downloaded)
@@ -98,7 +99,6 @@ class Onboarding(QWidget):
         self.start.clicked.connect(self._start)
         buttons.addWidget(self.start)
         layout.addLayout(buttons)
-        self._stop = False
         if need:
             threading.Thread(target=self._download, daemon=True).start()
 
@@ -139,7 +139,7 @@ class Onboarding(QWidget):
         seconds = sum(SECONDS.get(f.kind, 0.2) for f in files)
         if self.backend == "cpu":
             seconds *= 6
-        text = f"{len(files):,} files, {describe(seconds)}" if files else "nothing to read"
+        text = f"{len(files):,} files, {describe(seconds)}" if files else "nothing to read yet"
         self.bridge.estimate.emit(folder, text)
 
     def _estimated(self, folder: str, text: str) -> None:

@@ -41,8 +41,7 @@ class App:
     def __init__(self, qt: QApplication, background: bool):
         self.qt = qt
         self.settings = Settings.load()
-        self.colors = theme.palette()
-        qt.setStyleSheet(theme.stylesheet(self.colors))
+        self.colors = theme.apply(qt)
         qt.setWindowIcon(theme.app_icon())
         self.service = QueryService()
         self.panel = SearchPanel(self.service, self.settings)

@@ -265,8 +265,13 @@ def rtf_to_text(rtf: str) -> str:
                          "datastore", "themedata", "listtable", "listoverridetable", "rsidtbl", "xmlnstbl",
                          "generator", "latentstyles"}
     token = re.compile(r"\\([a-z]{1,32})(-?\d{1,10})? ?|\\'([0-9a-f]{2})|\\([^a-z])|([{}])|[\r\n]+|(.)", re.I | re.S)
+    skip = 0  # characters after \uN that stand in for it in old readers (\uc1: one)
     for match in token.finditer(rtf):
         word, arg, hexcode, char, brace, plain = match.groups()
+        if skip and (plain or hexcode):
+            skip -= 1
+            continue
+        skip = 0
         if brace == "{":
             stack.append(ignorable)
         elif brace == "}":
@@ -287,6 +292,7 @@ def rtf_to_text(rtf: str) -> str:
                 out.append("\t")
             elif word == "u" and arg:
                 out.append(chr(int(arg) % 65536))
+                skip = 1
         elif hexcode and not ignorable:
             out.append(bytes([int(hexcode, 16)]).decode("cp1252", "replace"))
         elif plain and not ignorable:

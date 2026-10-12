@@ -14,6 +14,8 @@ from . import rules
 from .model import IndexOptions
 
 LONGEST_PIECE = 4000
+# A real key: the armor line followed by its base64 body (code that only mentions the marker is fine).
+PRIVATE_KEY = re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----\s*[A-Za-z0-9+/=\s]{64,}")
 CLOSERS = {"end", "fi", "done", "esac", "@end", "#endif", "end;", "end)"}
 
 
@@ -59,7 +61,7 @@ def read(path: str, options: IndexOptions) -> CodeFile:
 
 
 def check(text: str, source: bool) -> None:
-    if "PRIVATE KEY-----" in text:
+    if PRIVATE_KEY.search(text):
         raise LeftOut("holds a private key")
     if not source:
         return

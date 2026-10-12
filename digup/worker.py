@@ -88,11 +88,8 @@ def serve(text_only: bool, backend: str | None = None) -> int:
 def worker_command(text_only: bool) -> list[str]:
     """How to start a worker: the frozen app's own exe, or this Python."""
     if getattr(sys, "frozen", False):
-        base = [sys.executable]
-        helper = Path(sys.executable).with_name("digup.exe")
-        if helper.exists():
-            base = [str(helper)]
-        args = base + ["worker"]
+        # The installed app: digup-cli.exe beside DigUp.exe (one name can't hold both on a case-insensitive disk).
+        args = [str(Path(sys.executable).with_name("digup-cli.exe")), "worker"]
     else:
         args = [sys.executable, "-m", "digup.cli", "worker"]
     return args + (["--text-only"] if text_only else [])

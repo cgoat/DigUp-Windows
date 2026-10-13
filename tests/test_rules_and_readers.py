@@ -48,9 +48,13 @@ def test_machine_names_and_datasets():
     assert not rules.looks_machine_named("PXL_20260101_123456789")
     assert not rules.looks_machine_named("Screenshot 2026-10-01 093107")
     assert not rules.looks_machine_named("Tokyo itinerary")
-    files = [("C:\\x\\clips", f"clip_{i:06d}", FileKind.VIDEO) for i in range(400)]
-    files += [("C:\\x\\holiday", f"IMG_{i}", FileKind.IMAGE) for i in range(400)]
-    assert rules.dataset_folders(files, roots={"C:\\x"}) == {"C:\\x\\clips": 400}
+    files = [("C:\\x\\clips", f"clip_{i:06d}", FileKind.VIDEO, 5_000_000) for i in range(400)]
+    files += [("C:\\x\\holiday", f"IMG_{i}", FileKind.IMAGE, 3_000_000) for i in range(400)]
+    # 50x50 dataset tiles whose names don't look machine-made; a few small graphics; a folder only partly tiny.
+    files += [("C:\\x\\tiles", f"9383_idx5_x{i}_y751_class1", FileKind.IMAGE, 6_000) for i in range(150)]
+    files += [("C:\\x\\icons", f"logo{i}", FileKind.IMAGE, 5_000) for i in range(40)]
+    files += [("C:\\x\\mixed", f"IMG_{i}", FileKind.IMAGE, 6_000 if i < 60 else 2_000_000) for i in range(150)]
+    assert rules.dataset_folders(files, roots={"C:\\x"}) == {"C:\\x\\clips": 400, "C:\\x\\tiles": 150}
 
 
 def test_crawler(tmp_path):

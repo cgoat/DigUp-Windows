@@ -197,15 +197,26 @@ def looks_machine_named(stem: str) -> bool:
     return re.fullmatch(r"[a-z]{0,16}[-_. ]?\d{3,}([-_.]\d+)*", name) is not None
 
 
-def dataset_folders(files: list[tuple[str, str, FileKind]], roots: set[str], minimum: int = 300) -> dict[str, int]:
-    """Folders with hundreds of same-kind, machine-named media files: training data, not your stuff."""
-    groups: dict[tuple[str, str], list[str]] = {}
+TINY_IMAGE_BYTES = 8 * 1024
+TINY_FOLDER_MINIMUM = 100
+
+
+def dataset_folders(files: list[tuple[str, str, FileKind, int]], roots: set[str], minimum: int = 300) -> dict[str, int]:
+    """Folders of training data or thumbnails, not your stuff:
+    - hundreds of same-kind, machine-named media files ("clip_000123", "3f9a1c0e-…"), or
+    - a hundred pictures or more, nearly all of them tiny files (under 8 KB: 50x50 dataset tiles, cached thumbnails).
+      Picked by the folder, not the file: on a real drive 15% of the pictures worth searching are under 8 KB too, but
+      they don't come a hundred to a folder. (On one drive this left out 2.1 million 6 KB tiles, copied six times.)"""
+    groups: dict[tuple[str, str], list[tuple[str, int]]] = {}
     lower_roots = {r.lower() for r in roots}
-    for folder, stem, kind in files:
+    for folder, stem, kind, size in files:
         if kind in (FileKind.IMAGE, FileKind.AUDIO, FileKind.VIDEO) and folder.lower() not in lower_roots:
-            groups.setdefault((folder, kind.value), []).append(stem)
+            groups.setdefault((folder, kind.value), []).append((stem, size))
     datasets: dict[str, int] = {}
-    for (folder, _), stems in groups.items():
-        if len(stems) >= minimum and sum(map(looks_machine_named, stems)) / len(stems) >= 0.7:
-            datasets[folder] = datasets.get(folder, 0) + len(stems)
+    for (folder, kind), items in groups.items():
+        machine = len(items) >= minimum and sum(looks_machine_named(s) for s, _ in items) / len(items) >= 0.7
+        tiny = (kind == FileKind.IMAGE.value and len(items) >= TINY_FOLDER_MINIMUM
+                and sum(size < TINY_IMAGE_BYTES for _, size in items) / len(items) >= 0.8)
+        if machine or tiny:
+            datasets[folder] = datasets.get(folder, 0) + len(items)
     return datasets

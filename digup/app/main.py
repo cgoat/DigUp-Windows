@@ -124,7 +124,11 @@ class App:
             _ = total
         self.status_action.setText(line)
         self.tray.setToolTip(f"DigUp — {line}")
-        self.tray.setIcon(theme.tray_icon(progress, paused=status.phase == "paused"))
+        # Redrawing the icon renders an SVG at seven sizes: only when the arc would visibly move.
+        icon_key = (None if progress is None else round(progress * 24), status.phase == "paused")
+        if icon_key != getattr(self, "_icon_key", object()):
+            self._icon_key = icon_key
+            self.tray.setIcon(theme.tray_icon(progress, paused=status.phase == "paused"))
         self.panel.set_engine_line(line if status.phase != "idle" else "")
 
     def _toggle_pause(self) -> None:

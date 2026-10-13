@@ -16,7 +16,7 @@ from typing import Callable
 
 from . import codeextract, crawler, extractors, media, paths, searchtext
 from .model import FileKind, IndexOptions, Modality, Prompts, SegmentKind, WorkerError
-from .store import FileRecord, IndexStore
+from .store import Candidate, FileRecord, IndexStore
 
 
 class FingerprintMismatch(Exception):
@@ -103,45 +103,85 @@ class Indexer:
     # MARK: Sync
 
     def sync(self, roots: list[str], should_stop=lambda: False) -> SyncSummary:
-        """Crawls `roots` and reconciles the index: new files queued, changed ones queued again, moved ones re-pathed
-        (nothing embedded again), and files that are gone or newly excluded removed."""
+        """Walks `roots` and reconciles the index: new files queued, changed ones queued again, moved ones re-pathed
+        (nothing embedded again), and files that are gone or newly excluded removed.
+
+        The walk streams into a temporary table and the comparison is SQL, so a drive of millions of files costs
+        disk, not memory (holding both sides as Python objects took gigabytes). Only the differences come back."""
         roots = [paths.normalize(r) for r in roots]
-        report = crawler.crawl(roots, self.options, should_stop)
-        existing = self.store.files_under(roots)
-        by_path = {f.path.lower(): f for f in existing}
-        by_id = {(f.device, f.inode): f for f in existing if f.inode}
-        seen = {c.path.lower() for c in report.candidates}
-        moved_from: set[str] = set()
+        report = crawler.CrawlReport()
         summary = SyncSummary(crawl=report)
+        db = self.store.db
+        db.execute("CREATE TEMP TABLE IF NOT EXISTS scan(key TEXT PRIMARY KEY, path TEXT, kind TEXT, size INTEGER, "
+                   "mtime REAL, inode INTEGER, device INTEGER) WITHOUT ROWID")
+        db.execute("CREATE TEMP TABLE IF NOT EXISTS known(key TEXT PRIMARY KEY, id INTEGER, path TEXT, kind TEXT, "
+                   "size INTEGER, mtime REAL, inode INTEGER, device INTEGER) WITHOUT ROWID")
+        db.execute("CREATE TEMP TABLE IF NOT EXISTS gone(id INTEGER PRIMARY KEY, path TEXT, size INTEGER, mtime REAL, "
+                   "inode INTEGER, device INTEGER, moved INTEGER DEFAULT 0)")
+        db.execute("CREATE INDEX IF NOT EXISTS temp.gone_inode ON gone(device, inode)")
+        for table in ("scan", "known", "gone"):
+            db.execute(f"DELETE FROM temp.{table}")
+
+        batch = []
+        for c in crawler.walk(roots, self.options, report, should_stop):
+            batch.append((c.path.lower(), c.path, c.kind.value, c.size, c.mtime, _i64(c.inode), _i64(c.device)))
+            if len(batch) >= 5000:
+                db.executemany("INSERT OR IGNORE INTO temp.scan VALUES(?, ?, ?, ?, ?, ?, ?)", batch)
+                batch.clear()
+        if batch:
+            db.executemany("INSERT OR IGNORE INTO temp.scan VALUES(?, ?, ?, ?, ?, ?, ?)", batch)
+        ranges = " OR ".join("(path >= ? AND path < ?)" for _ in roots) or "0"
+        bounds = [v for r in roots for v in (paths.prefix(r), paths.prefix(r) + "\U0010ffff")]
+        db.execute("INSERT OR IGNORE INTO temp.known SELECT lower(path), id, path, kind, size, mtime, inode, device "
+                   f"FROM files WHERE {ranges}", bounds)
+
         with self.store.transaction():
-            for file in report.candidates:
-                row = by_path.get(file.path.lower())
-                if row:
-                    if row.size != file.size or abs(row.mtime - file.mtime) > 0.001 or row.kind != file.kind:
-                        self.store.requeue_changed(row.id, file)
-                        summary.changed += 1
-                        summary.queued.append(row.id)
+            # Changed: the same path with another size, date or kind.
+            changed = db.execute(
+                "SELECT k.id, s.path, s.kind, s.size, s.mtime, s.inode, s.device FROM temp.scan s "
+                "JOIN temp.known k ON k.key = s.key "
+                "WHERE k.size != s.size OR abs(k.mtime - s.mtime) > 0.001 OR k.kind != s.kind").fetchall()
+            for fid, path, kind, size, mtime, inode, device in changed:
+                self.store.requeue_changed(fid, Candidate(path, FileKind(kind), size, mtime, inode, device))
+                summary.queued.append(fid)
+            summary.changed = len(changed)
+            matched = db.execute("SELECT COUNT(*) FROM temp.scan s JOIN temp.known k ON k.key = s.key").fetchone()[0]
+            summary.unchanged = matched - summary.changed
+
+            # Gone from where they were: removed, or moved (found again below by file id, size and date).
+            db.execute("INSERT INTO temp.gone(id, path, size, mtime, inode, device) "
+                       "SELECT id, path, size, mtime, inode, device FROM temp.known "
+                       "WHERE key NOT IN (SELECT key FROM temp.scan)")
+            new = db.execute("SELECT path, kind, size, mtime, inode, device FROM temp.scan "
+                             "WHERE key NOT IN (SELECT key FROM temp.known)")
+            while rows := new.fetchmany(2000):
+                for path, kind, size, mtime, inode, device in rows:
+                    file = Candidate(path, FileKind(kind), size, mtime, inode, device)
+                    match = db.execute(
+                        "SELECT id FROM temp.gone WHERE device = ? AND inode = ? AND size = ? "
+                        "AND abs(mtime - ?) < 0.001 AND moved = 0 LIMIT 1", (device, inode, size, mtime)
+                    ).fetchone() if inode else None
+                    if match:
+                        self.store.move(match[0], path)
+                        db.execute("UPDATE temp.gone SET moved = 1 WHERE id = ?", (match[0],))
+                        summary.moved += 1
                     else:
-                        summary.unchanged += 1
-                    continue
-                other = by_id.get((_i64(file.device), _i64(file.inode))) if file.inode else None
-                if (other and other.path.lower() not in seen and other.path.lower() not in moved_from
-                        and other.size == file.size and abs(other.mtime - file.mtime) < 0.001):
-                    self.store.move(other.id, file.path)
-                    moved_from.add(other.path.lower())
-                    summary.moved += 1
-                    continue
-                summary.queued.append(self.store.insert(file))
-                summary.added += 1
-            # A root that went away mid-walk (a drive unplugged) looked emptier than it is: keep its rows.
-            vanished = [r for r in roots if not os.path.isdir(r)]
-            # Only a walk that reached the end says what's gone: a stopped one saw part of the folders.
+                        summary.queued.append(self.store.insert(file))
+                        summary.added += 1
+
+            # Only a walk that reached the end says what's gone (a stopped one saw part of the folders), and a root
+            # that went away mid-walk (a drive unplugged) looked emptier than it is: its rows stay.
             if report.complete and not should_stop():
-                gone = [row.id for row in existing
-                        if row.path.lower() not in seen and row.path.lower() not in moved_from
-                        and not any(paths.is_inside(row.path, v) for v in vanished)]
-                self.store.delete_many(gone)
+                vanished = [r for r in roots if not os.path.isdir(r)]
+                keep = " AND ".join("NOT (path >= ? AND path < ?)" for _ in vanished) or "1"
+                keep_args = [v for r in vanished for v in (paths.prefix(r), paths.prefix(r) + "\U0010ffff")]
+                cursor = db.execute(f"SELECT id FROM temp.gone WHERE moved = 0 AND {keep}", keep_args)
+                gone = [r[0] for r in cursor.fetchall()]
+                for i in range(0, len(gone), 50_000):
+                    self.store.delete_many(gone[i:i + 50_000])
                 summary.removed = len(gone)
+        for table in ("scan", "known", "gone"):
+            db.execute(f"DELETE FROM temp.{table}")
         return summary
 
     # MARK: Run

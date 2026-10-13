@@ -639,12 +639,24 @@ class SearchPanel(QWidget):
         self.preview.show_hit(current.data(Qt.ItemDataRole.UserRole) if current.isValid() else None)
 
     def service_text(self, hit: SearchHit) -> str | None:
-        searcher = self.service._searchers.get("code.sqlite" if hit.kind == FileKind.CODE else "index.sqlite")
-        if searcher is None:
-            return None
+        """A passage for the preview, through a connection of the UI's own: the search's connection may be busy
+        for a while, and waiting for it froze the window."""
+        import sqlite3
+
+        from .. import paths
+
+        name = "code.sqlite" if hit.kind == FileKind.CODE else "index.sqlite"
+        if not hasattr(self, "_text_db"):
+            self._text_db = {}
         try:
-            return searcher.text_of_segment(hit.segment_id)
-        except Exception:
+            db = self._text_db.get(name)
+            if db is None:
+                db = sqlite3.connect(f"file:{paths.index() / name}?mode=ro", uri=True, timeout=1,
+                                     check_same_thread=False)
+                self._text_db[name] = db
+            row = db.execute("SELECT coalesce(original, body) FROM fts WHERE rowid = ?", (hit.segment_id,)).fetchone()
+            return row[0] if row else None
+        except sqlite3.Error:
             return None
 
     # MARK: Acting on a result

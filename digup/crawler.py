@@ -41,30 +41,43 @@ def _attributes(st) -> int:
 
 
 def crawl(roots: list[str], options: IndexOptions, should_stop=lambda: False) -> CrawlReport:
+    """Every file to index under `roots`, as a list in the report (for a few folders; `walk` streams them)."""
     report = CrawlReport()
-    project_roots: set[str] = set()
-    repos = GitRepos()
-    found: list[Candidate] = []
-    seen_paths: set[str] = set()
-    root_paths = {paths.normalize(r) for r in roots}
+    report.candidates = list(walk(roots, options, report, should_stop))
+    return report
 
-    for root in sorted(root_paths):
+
+def walk(roots: list[str], options: IndexOptions, report: CrawlReport, should_stop=lambda: False):
+    """Yields the files to index under `roots`, a folder at a time, and counts what it leaves out in `report`.
+    `report.complete` is set when the walk reached the end. Memory stays at one folder's files, so a drive with
+    millions of them can be walked (holding them all took gigabytes).
+
+    The rules that look at more than one file are decided per folder as it goes: inside a code project only
+    screenshots count (a folder is in one when it or a folder above it has a project marker), and a folder of
+    hundreds of machine-named or tiny media files is a dataset (`rules.dataset_folders`)."""
+    repos = GitRepos()
+    normalized = sorted({paths.normalize(r) for r in roots}, key=len)
+    # A root inside another root is walked with it, once.
+    root_paths = [r for i, r in enumerate(normalized) if not any(paths.is_inside(r, o) for o in normalized[:i])]
+    all_roots = set(normalized)
+    media = (FileKind.IMAGE, FileKind.AUDIO, FileKind.VIDEO)
+
+    for root in root_paths:
         if not os.path.isdir(root):
             continue
         if options.code:
             repos.enter_root(root)
-        elif rules.is_project_root(root):
-            project_roots.add(root.lower())
         skips = [f for f in options.excluded_folders if paths.is_inside(f, root) and not paths.is_inside(root, f)]
-        stack = [root]
+        stack = [(root, (not options.code) and rules.is_project_root(root))]
         while stack:
             if should_stop():
-                return report
-            folder = stack.pop()
+                return
+            folder, in_project = stack.pop()
             try:
                 entries = list(os.scandir(folder))
             except OSError:
                 continue
+            found: list[Candidate] = []
             for entry in entries:
                 try:
                     st = entry.stat(follow_symlinks=False)
@@ -83,9 +96,9 @@ def crawl(roots: list[str], options: IndexOptions, should_stop=lambda: False) ->
                         continue
                     if options.code:
                         repos.enter(entry.path)
-                    elif rules.is_project_root(entry.path):
-                        project_roots.add(entry.path.lower())
-                    stack.append(entry.path)
+                        stack.append((entry.path, False))
+                    else:
+                        stack.append((entry.path, in_project or rules.is_project_root(entry.path)))
                     continue
                 if attributes & HIDDEN or entry.name.startswith("."):
                     continue
@@ -110,54 +123,30 @@ def crawl(roots: list[str], options: IndexOptions, should_stop=lambda: False) ->
                     if repos.ignores(entry.path):
                         report.skip("ignored by git")
                         continue
-                key = entry.path.lower()
-                if key in seen_paths:
+                elif in_project and value != FileKind.SCREENSHOT:
+                    report.skip("inside a code project")
                     continue
-                seen_paths.add(key)
+                found.append(Candidate(entry.path, value, st.st_size, st.st_mtime, 0, 0))
+            if not found:
+                continue
+            if not options.include_datasets and not options.code:
+                datasets = rules.dataset_folders(
+                    [(folder, os.path.splitext(os.path.basename(f.path))[0], f.kind, f.size) for f in found],
+                    roots=all_roots,
+                )
+                if datasets:
+                    report.datasets[folder] = report.datasets.get(folder, 0) + datasets[folder]
+                    kept = [f for f in found if f.kind not in media]
+                    report.skipped["dataset"] = report.skipped.get("dataset", 0) + len(found) - len(kept)
+                    found = kept
+            for file in found:
                 try:
-                    full = os.stat(entry.path)  # DirEntry leaves st_ino at 0 on Windows
-                    inode, device = full.st_ino, full.st_dev
+                    full = os.stat(file.path)  # DirEntry leaves st_ino at 0 on Windows: moves are found by it
+                    file.inode, file.device = full.st_ino, full.st_dev
                 except OSError:
-                    inode, device = 0, 0
-                found.append(Candidate(entry.path, value, st.st_size, st.st_mtime, inode, device))
-
-    # Inside a code project only screenshots count (assets, fixtures and datasets don't).
-    memo: dict[str, bool] = {}
-
-    def in_project(folder: str) -> bool:
-        key = folder.lower()
-        if key in memo:
-            return memo[key]
-        parent = os.path.dirname(folder)
-        answer = key in project_roots or (parent != folder and len(parent) > 3 and in_project(parent))
-        memo[key] = answer
-        return answer
-
-    kept = []
-    for file in found:
-        if not options.code and file.kind != FileKind.SCREENSHOT and in_project(os.path.dirname(file.path)):
-            report.skip("inside a code project")
-        else:
-            kept.append(file)
-
-    if not options.include_datasets and not options.code:
-        datasets = rules.dataset_folders(
-            [(os.path.dirname(f.path), os.path.splitext(os.path.basename(f.path))[0], f.kind) for f in kept],
-            roots=root_paths,
-        )
-        if datasets:
-            report.datasets = datasets
-            media = (FileKind.IMAGE, FileKind.AUDIO, FileKind.VIDEO)
-            remaining = []
-            for f in kept:
-                if os.path.dirname(f.path) in datasets and f.kind in media:
-                    report.skip("dataset")
-                else:
-                    remaining.append(f)
-            kept = remaining
-    report.candidates = kept
+                    pass
+                yield file
     report.complete = True
-    return report
 
 
 class GitRepos:

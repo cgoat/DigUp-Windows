@@ -61,6 +61,29 @@ Windows-specific rules ([rules.py](digup/rules.py), [crawler.py](digup/crawler.p
   ShareX and others name them, or anything in a `Screenshots` folder.
 - `.sln`/`.csproj` mark a code project, alongside `.git`, `package.json` and the rest.
 
+## Memory and big drives
+
+Indexing a whole data drive (2.2 million files, a million vectors) shaped these:
+
+- **Vectors are a memory-mapped file**, not Python memory ([vectorcache.py](digup/vectorcache.py)): 768 int8 values
+  and a scale per vector (cosines within 0.0015 of fp16; top 200 results unchanged), beside the index as
+  `index.vectors/`. Mapped pages belong to the file system cache, so the search process owns about 300 MB instead of
+  1.5 GB (3 GB while loading), and the next start has them at once. Indexing passes append what they added. A trigger
+  logs deleted vectors (`vec_gone`): SQLite can give a new segment a deleted one's id, and the log keeps the cache
+  from ever serving the old vector. Mostly-dead caches are written anew in a new generation folder (Windows can't
+  replace a mapped file).
+- **Scoring** runs on six threads, a 4,096-row slice at a time (0.2 s for a million vectors); each file's best row
+  is picked with NumPy, not a Python loop; the word search runs beside it. NumPy's BLAS gets one thread
+  (`OPENBLAS_NUM_THREADS=1`): it otherwise reserves buffers for every core (750 MB on 32 cores).
+- **A scan streams** ([crawler.py](digup/crawler.py) `walk`): files come a folder at a time, the code-project and
+  dataset rules are decided per folder, and the comparison with the index happens in SQLite temporary tables
+  ([indexer.py](digup/indexer.py) `sync`). Holding both sides as Python objects took gigabytes.
+- **Datasets and thumbnails** are left out by folder: hundreds of machine-named media files, or 100+ pictures nearly
+  all under 8 KB (2.1 million 50x50 tiles on one drive). Windows backup folders (File History, system images,
+  `$`-folders) are never walked.
+- **The UI thread** only paints: status updates are capped at four a second, the tray icon is redrawn when its arc
+  moves, Settings reads its numbers on a thread, and the preview has its own read-only connection.
+
 ## Search
 
 Hybrid, as on the Mac ([searcher.py](digup/searcher.py)): every vector's cosine is put on a per-query scale (minus its

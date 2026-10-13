@@ -66,6 +66,8 @@ class Engine(QObject):
         self._observer = None
         self._thread = threading.Thread(target=self._loop, name="digup-engine", daemon=True)
         self._status = Status()
+        self._last_emit = 0.0
+        self._caches: dict = {}
         self._interrupt = False
 
     # MARK: Control (any thread)
@@ -146,11 +148,20 @@ class Engine(QObject):
 
     # MARK: The loop (the engine thread)
 
+    STATUS_INTERVAL = 0.25  # seconds between status updates while files fly by (the UI redraws on each)
+
     def _emit(self, **changes) -> None:
+        phase_before = self._status.phase
         for key, value in changes.items():
             setattr(self._status, key, value)
         if self._stop:
             return
+        # Hundreds of files a second (small pictures skipped) would bury the UI thread in updates: send at most
+        # four a second, and every change of phase right away.
+        now = time.time()
+        if self._status.phase == phase_before and now - self._last_emit < self.STATUS_INTERVAL:
+            return
+        self._last_emit = now
         try:
             self.status.emit(Status(**self._status.__dict__))
         except RuntimeError:  # the app is shutting down and the Qt object is gone
@@ -198,8 +209,10 @@ class Engine(QObject):
                 for name in (MAIN_FILE, CODE_FILE):
                     if name == CODE_FILE and not (self.settings.code_search and self.settings.code_folders):
                         continue
-                    indexer = indexers.get(name) or self._make_indexer(name)
-                    indexers[name] = indexer
+                    if name not in indexers:
+                        indexers[name] = self._make_indexer(name)
+                        self._update_cache(name, indexers[name])
+                    indexer = indexers[name]
                     if name in due:
                         with self._wake:
                             self._dirty.pop(name, None)
@@ -207,8 +220,9 @@ class Engine(QObject):
                     worked |= self._index(indexer, name)
                 if worked:
                     last_work = time.time()
-                    for ix in indexers.values():
+                    for name, ix in indexers.items():
                         ix.store.checkpoint()
+                        self._update_cache(name, ix)
             except WorkerError as error:
                 self.message.emit(f"The model stopped: {error}")
                 self._emit(phase="error", note=str(error)[:200])
@@ -235,6 +249,20 @@ class Engine(QObject):
 
     def _backend(self) -> str:
         return self.settings.backend_choice or downloads.best_backend()
+
+    def _update_cache(self, name: str, indexer: Indexer) -> None:
+        """Appends what indexing added to the vector cache, so a search finds it mapped and ready."""
+        from ..vectorcache import VectorCache
+
+        try:
+            cache = self._caches.get(name) or VectorCache(indexer.store)
+            self._caches[name] = cache
+            if not cache._read_meta():
+                self._emit(phase="syncing", note="preparing search (once)", current="")
+            if cache.update(wait=1.0):
+                self.changed.emit(name)
+        except Exception:  # noqa: BLE001 - search builds it itself if this fails
+            self._log(traceback.format_exc())
 
     def _make_indexer(self, name: str) -> Indexer:
         from ..worker import EmbeddingWorker

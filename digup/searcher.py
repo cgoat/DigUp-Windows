@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from . import codeextract, searchtext
-from .model import DIM, FileKind, IndexOptions, SegmentKind
+from .model import DIM, FileKind, SegmentKind
 from .store import IndexStore
 
 
@@ -140,21 +140,60 @@ def meaning(scores: np.ndarray, modality: np.ndarray, sets_scale: np.ndarray | N
     return (centered - mean) / deviation
 
 
+KIND_CODES = {kind: i + 1 for i, kind in enumerate(FileKind)}
+KINDS_BY_CODE = {i + 1: kind for i, kind in enumerate(FileKind)}
+
+
+class _Best:
+    """Each file's best-scoring vector row for one query, as arrays sorted by file id: (z, cosine, row) per file
+    without a Python object for each of the 100,000 files that score above average on a big index."""
+
+    def __init__(self, files=None, z=None, cosine=None, rows=None, kinds=None):
+        empty = np.zeros(0)
+        self.files = files if files is not None else empty.astype(np.int64)
+        self.z, self.cosine = (z if z is not None else empty), (cosine if cosine is not None else empty)
+        self.rows = rows if rows is not None else empty.astype(np.int64)
+        self.kinds = kinds if kinds is not None else empty.astype(np.uint8)
+
+    def _index(self, file: int) -> int:
+        i = int(np.searchsorted(self.files, file))
+        return i if i < len(self.files) and self.files[i] == file else -1
+
+    def get(self, file: int):
+        i = self._index(file)
+        return None if i < 0 else (float(self.z[i]), float(self.cosine[i]), int(self.rows[i]))
+
+    def __contains__(self, file: int) -> bool:
+        return self._index(file) >= 0
+
+    def __getitem__(self, file: int):
+        found = self.get(file)
+        if found is None:
+            raise KeyError(file)
+        return found
+
+    def above(self, gate: float) -> list[int]:
+        return self.files[self.z >= gate].tolist()
+
+    def kind_of(self, file: int):
+        i = self._index(file)
+        return None if i < 0 else KINDS_BY_CODE.get(int(self.kinds[i]))
+
+
 class Searcher:
-    def __init__(self, store: IndexStore, load_vectors: bool = True):
+    """Meaning from the vector cache on disk (`VectorCache`, memory-mapped), words from FTS5. Nothing big is held:
+    the cache maps the vectors, and file kinds come from the cache's rows and the database."""
+
+    def __init__(self, store: IndexStore, load_vectors: bool = True, update_cache: bool = True):
+        from .vectorcache import VectorCache
+
         self.store = store
-        self.matrix: np.ndarray | None = None  # rows x 768 float16
-        self.row_file = np.zeros(0, dtype=np.int64)
-        self.row_segment = np.zeros(0, dtype=np.int64)
-        self.row_modality = np.zeros(0, dtype="<U5")
-        self.row_sets_scale = np.zeros(0, dtype=bool)
-        self.file_kind: dict[int, FileKind] = {}
-        self.vector_source: str | None = None
+        self.cache = VectorCache(store)
+        self.update_cache = update_cache  # bring the cache up to date before searching (False: the engine does it)
+        self.vector_source: str | None = store.meta("vector_source")
         self.vectors_loaded = False
         if load_vectors:
             self.reload()
-        else:
-            self._reload_files()
 
     @property
     def is_code(self) -> bool:
@@ -162,53 +201,36 @@ class Searcher:
 
     @property
     def vector_count(self) -> int:
-        return len(self.row_file)
+        return int(self.cache.alive().sum()) if self.vectors_loaded and self.cache.n else 0
 
     def reload(self) -> None:
-        self.release_vectors()
-        self._reload_files()
-        steps = IndexOptions()
-        rows = self.store.db.execute(
-            "SELECT s.id, s.file, s.modality, s.vec, s.kind, s.loc, f.kind, "
-            "CAST(json_extract(f.info, '$.pages') AS INTEGER) "
-            "FROM segments s JOIN files f ON f.id = s.file WHERE s.vec IS NOT NULL ORDER BY s.id"
-        ).fetchall()
-        rows = [r for r in rows if r[3] is not None and len(r[3]) == DIM * 2]
-        if rows:
-            self.matrix = np.frombuffer(b"".join(r[3] for r in rows), dtype=np.float16).reshape(len(rows), DIM)
-            self.row_segment = np.array([r[0] for r in rows], dtype=np.int64)
-            self.row_file = np.array([r[1] for r in rows], dtype=np.int64)
-            self.row_modality = np.array([r[2] for r in rows])
-            later = []
-            for r in rows:
-                kind, place = r[4], int(r[5] or 0)
-                if r[6] == "pdf":
-                    later.append(kind != "chunk" and (r[7] or 0) > steps.big_pdf_pages and place > steps.pdf_step)
-                else:
-                    later.append(kind == "chunk" and place > steps.doc_step)
-            self.row_sets_scale = ~np.array(later, dtype=bool)
+        """Catches the cache up with the index (appending what's new: quick after the first time) and maps it."""
+        if self.update_cache:
+            self.cache.update()
+        self.cache.open()
+        self.vector_source = self.store.meta("vector_source")
         self.vectors_loaded = True
 
     def release_vectors(self) -> None:
-        self.matrix = None
-        self.row_file = np.zeros(0, dtype=np.int64)
-        self.row_segment = np.zeros(0, dtype=np.int64)
-        self.row_modality = np.zeros(0, dtype="<U5")
-        self.row_sets_scale = np.zeros(0, dtype=bool)
+        self.cache.close()
         self.vectors_loaded = False
 
     def _reload_files(self) -> None:
-        self.file_kind = {r[0]: FileKind(r[1]) for r in self.store.db.execute("SELECT id, kind FROM files")}
         self.vector_source = self.store.meta("vector_source")
 
     def score(self, query) -> np.ndarray:
-        """Cosine similarity with every stored vector (all are L2-normalized), a block of rows at a time."""
-        if self.matrix is None:
+        if not self.cache.n:
             return np.zeros(0, dtype=np.float32)
-        q = np.asarray(query, dtype=np.float32)
-        out = np.empty(len(self.matrix), dtype=np.float32)
-        for start in range(0, len(self.matrix), 8192):
-            out[start:start + 8192] = self.matrix[start:start + 8192].astype(np.float32) @ q
+        return self.cache.score(query)
+
+    def _kinds_of(self, files) -> dict[int, FileKind]:
+        out: dict[int, FileKind] = {}
+        files = list(files)
+        for i in range(0, len(files), 900):
+            chunk = files[i:i + 900]
+            for fid, kind in self.store.db.execute(
+                    f"SELECT id, kind FROM files WHERE id IN ({','.join('?' * len(chunk))})", chunk):
+                out[fid] = FileKind(kind)
         return out
 
     def search(self, text: str, query_vector=None, kinds: set[FileKind] | None = None, limit: int = 20,
@@ -216,50 +238,69 @@ class Searcher:
         word_weight = word_weight if word_weight is not None else (CODE_WORD_WEIGHT if self.is_code else WORD_WEIGHT)
         if query_vector is not None and not self.vectors_loaded:
             self.reload()
-        file_kind = self.file_kind
+        file_kind: dict[int, FileKind] = {}
 
-        def allowed(file: int) -> bool:
-            return kinds is None or file_kind.get(file) in kinds
-
-        # Meaning: score every vector on this query's scale, keep each file's best segment.
-        best: dict[int, tuple[float, float, int]] = {}
-        if query_vector is not None and len(query_vector) == DIM and len(self.row_file):
-            scores = self.score(query_vector)
-            z = meaning(scores, self.row_modality, self.row_sets_scale)
-            order = np.argsort(-z, kind="stable")
-            for row in order:
-                file = int(self.row_file[row])
-                if file in best or not allowed(file):
-                    continue
-                best[file] = (float(z[row]), float(scores[row]), int(row))
-                if z[row] < z_gate - 4:
-                    break  # far below the gate: neither scored nor pointed at
-
-        # Words: FTS5 with Porter stemming over names, folders, OCR, page and document text.
+        # Meaning: score every vector on this query's scale, keep each file's best segment (vectorized: a million
+        # rows take a fraction of a second, all cores).
         words_ = terms(text)
         ident = codeextract.identifier(text) if self.is_code else None
-        word_hits: list[tuple[int, int, str | None]] = []
-        coverage: dict[int, float] = {}
         pats = [codeextract.phrase(ident)] if ident else patterns(words_, prefix_last)
         db = self.store.db
-        if pats:
-            seen: set[int] = set()
+
+        def fetch_word_rows():
             try:
-                rows = db.execute(
+                return db.execute(
                     "SELECT s.file, s.id, snippet(fts, 1, '«', '»', '…', 12), fts.original FROM fts "
                     "JOIN segments s ON s.id = fts.rowid WHERE fts MATCH ? ORDER BY bm25(fts, 3.0, 1.0) LIMIT ?",
                     (" OR ".join(pats), max(1000, limit * 10)),
                 ).fetchall()
-            except Exception:
-                rows = []
+            except Exception:  # noqa: BLE001 - a query FTS5 can't parse: no word matches
+                return []
+
+        from .vectorcache import _pool
+
+        word_rows = _pool.submit(fetch_word_rows) if pats else None
+        best = _Best()
+        row_segment = None
+        if query_vector is not None and len(query_vector) == DIM and self.cache.n:
+            cols = self.cache.cols
+            n = self.cache.n
+            alive = cols["dead"][:n] == 0
+            scores = self.score(query_vector)
+            modality = np.asarray(cols["modality"][:n])
+            z = meaning(scores, modality, (np.asarray(cols["sets_scale"][:n]) == 1) & alive)
+            keep = alive & (z > 0)  # below the average: it neither qualifies nor adds to a score
+            if kinds is not None:
+                keep &= np.isin(np.asarray(cols["kind"][:n]), [KIND_CODES[k] for k in kinds])
+            rows = np.nonzero(keep)[0]
+            if rows.size:
+                order = rows[np.argsort(-z[rows], kind="stable")]
+                uniq, first = np.unique(np.asarray(cols["files"])[order], return_index=True)  # each file's best row
+                top = order[first]
+                best = _Best(uniq, z[top], scores[top], top, np.asarray(cols["kind"])[top])
+                row_segment = cols["ids"]
+
+        def kind_of(file: int):
+            return file_kind.get(file) or best.kind_of(file)
+
+        def allowed(file: int) -> bool:
+            return kinds is None or kind_of(file) in kinds
+
+        # Words: FTS5 with Porter stemming over names, folders, OCR, page and document text (fetched above).
+        word_hits: list[tuple[int, int, str | None, str | None]] = []
+        coverage: dict[int, float] = {}
+        if pats:
+            seen: set[int] = set()
+            rows = word_rows.result()
+            if kinds is not None:
+                file_kind.update(self._kinds_of({r[0] for r in rows if r[0] not in best} - set(file_kind)))
             for file, seg, snip, original in rows:
                 if len(word_hits) >= max(100, limit) or not allowed(file) or file in seen:
                     continue
                 seen.add(file)
-                quoted = searchtext.snippet(original, words_) if original else None
-                word_hits.append((file, seg, quoted or snip))
+                word_hits.append((file, seg, snip, original))
             if word_hits:
-                files = ",".join(str(f) for f, _, _ in word_hits)
+                files = ",".join(str(h[0]) for h in word_hits)
                 for pattern in pats:
                     try:
                         for (file,) in db.execute(
@@ -274,17 +315,26 @@ class Searcher:
         lookup = is_lookup(words_) or ident is not None
         meaning_weight, words_weight = (0.5, word_weight * 2) if lookup else (1.0, word_weight)
         hinted = kind_hints(text)
-        candidates = {f for f, v in best.items() if v[0] >= z_gate} | {f for f, s in coverage.items() if s >= 0.5}
+        candidates = set(best.above(z_gate)) | {f for f, s in coverage.items() if s >= 0.5}
+        if hinted:
+            file_kind.update(self._kinds_of({f for f in candidates if f not in best} - set(file_kind)))
         scored: dict[int, float] = {}
         for file in candidates:
             s = meaning_weight * max(best[file][0] if file in best else 0, 0) + words_weight * coverage.get(file, 0) ** 1.5
-            if file_kind.get(file) in hinted:
+            if kind_of(file) in hinted:
                 s += 1
             scored[file] = s
 
         word_rank: dict[int, tuple[int, tuple[int, int, str | None]]] = {}
-        for i, hit in enumerate(word_hits):
-            word_rank.setdefault(hit[0], (i + 1, hit))
+        for i, (file, seg, snip, original) in enumerate(word_hits):
+            word_rank.setdefault(file, (i + 1, (file, seg, (snip, original))))
+        quoted: dict[int, str | None] = {}
+
+        def snippet_of(match) -> str | None:
+            snip, original = match[2]
+            if match[1] not in quoted:
+                quoted[match[1]] = (searchtext.snippet(original, words_) if original else None) or snip
+            return quoted[match[1]]
         hits: list[SearchHit] = []
         for file, s in sorted(scored.items(), key=lambda kv: (-kv[1], kv[0]))[:limit]:
             rank = len(hits)
@@ -292,7 +342,7 @@ class Searcher:
             keyword = word_rank.get(file)
             use_meaning = semantic is not None and (semantic[0] >= z_gate or keyword is None)
             if use_meaning:
-                segment_id = int(self.row_segment[semantic[2]])
+                segment_id = int(row_segment[semantic[2]])
             elif keyword:
                 segment_id = keyword[1][1]
             else:
@@ -307,12 +357,13 @@ class Searcher:
             seg = db.execute("SELECT kind, loc, loc_end, excerpt FROM segments WHERE id = ?", (segment_id,)).fetchone()
             seg_kind, loc, loc_end, stored = (seg if seg else ("name", None, None, None))
             snippet = None
-            if keyword and keyword[1][1] == segment_id and keyword[1][2] and "«" in keyword[1][2]:
-                snippet = searchtext.excerpt(keyword[1][2], 400)
-            if snippet is None and stored is None and loc is None and keyword and keyword[1][2] and "«" in keyword[1][2]:
+            marked = snippet_of(keyword[1]) if keyword else None
+            if keyword and keyword[1][1] == segment_id and marked and "«" in marked:
+                snippet = searchtext.excerpt(marked, 400)
+            if snippet is None and stored is None and loc is None and marked and "«" in marked:
                 matched = db.execute("SELECT kind FROM segments WHERE id = ?", (keyword[1][1],)).fetchone()
                 if matched and matched[0] != "name":
-                    snippet = searchtext.excerpt(keyword[1][2], 400)
+                    snippet = searchtext.excerpt(marked, 400)
             hits.append(SearchHit(
                 path=row[0], kind=FileKind(row[1]), score=s, z=semantic[0] if semantic else None,
                 cosine=semantic[1] if semantic else None, keyword_rank=keyword[0] if keyword else None,

@@ -60,7 +60,7 @@ CREATE VIRTUAL TABLE fts USING fts5({FTS_COLUMNS});
 """
 
 
-@dataclass
+@dataclass(slots=True)  # millions of these during a scan of a big drive: slots halve their memory
 class FileRecord:
     id: int
     path: str
@@ -72,7 +72,7 @@ class FileRecord:
     state: str
 
 
-@dataclass
+@dataclass(slots=True)
 class Candidate:
     """A file the crawler decided to index."""
 
@@ -133,9 +133,13 @@ class IndexStore:
                         self.db.execute(statement)
                 self.db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         self.db.execute("PRAGMA busy_timeout = 5000")
-        # Counting vectors without reading them: modality is 'none' exactly when a segment has no vector.
+        # Counting vectors without reading them (modality is 'none' exactly when a segment has no vector), and the
+        # log of deleted vectors the vector cache reads (vectorcache.py).
         try:
             self.db.execute("CREATE INDEX IF NOT EXISTS segments_modality ON segments(modality)")
+            from .vectorcache import install_trigger
+
+            install_trigger(self.db)
         except sqlite3.OperationalError:
             pass  # another process holds the write lock; it will be made next time
 
@@ -248,15 +252,16 @@ class IndexStore:
         self.db.execute("DELETE FROM files WHERE id = ?", (id,))
 
     def prune(self, keeping_under: list[str]) -> int:
-        """Removes every file that isn't under one of `keeping_under` (folders taken out of the app)."""
-        gone = [
-            r[0]
-            for r in self.db.execute("SELECT id, path FROM files")
-            if not any(paths.is_inside(r[1], root) for root in keeping_under)
-        ]
+        """Removes every file that isn't under one of `keeping_under` (folders taken out of the app). One query, not
+        a Python loop over every path in the index."""
+        roots = [paths.normalize(r) for r in keeping_under]
+        outside = " AND ".join("NOT (path >= ? AND path < ?)" for _ in roots) or "1"
+        args = [v for r in roots for v in (paths.prefix(r), paths.prefix(r) + _END)]
+        gone = [r[0] for r in self.db.execute(f"SELECT id FROM files WHERE {outside}", args).fetchall()]
         if gone:
             with self.transaction():
-                self.delete_many(gone)
+                for i in range(0, len(gone), 50_000):
+                    self.delete_many(gone[i:i + 50_000])
         return len(gone)
 
     def reset_all(self) -> None:

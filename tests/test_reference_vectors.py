@@ -40,7 +40,7 @@ def test_vectors_match_the_mac_reference():
 
     reference = json.loads((FOLDER / "vectors.json").read_text())
     assert reference["vector_version"] == VECTOR_VERSION
-    embedder = LlamaEmbedder(text_only=False)
+    embedder = LlamaEmbedder(text_only=False, max_tokens=2048)  # the reference's cut
     try:
         made = dict(zip([n for n, _ in TEXTS], embedder.embed_texts([t for _, t in TEXTS])))
         for name, file, budget in IMAGES:

@@ -35,6 +35,10 @@ MAX_SEQUENCES = 16
 # The DLLs reserve n_vocab floats (1 MiB) of pinned memory per token in a batch (the Mac build patches this out):
 # texts are packed into batches of at most this many tokens, while one input may still use the whole context.
 TEXT_BATCH_TOKENS = 512
+# Indexing cuts one input at this many tokens. The buffer above grows to the longest input (1 MiB a token, kept), and
+# DigUp's inputs are shorter: passages ~450 tokens, PDF pages (4,000 characters) ~1,000, 30 s of sound 750, a
+# screenshot 280. The reference cuts at 2,048 (`max_tokens=2048` reproduces it, as the parity test does).
+INDEX_MAX_TOKENS = 1024
 
 
 def model_info(backend: str, text_only: bool = False, load_seconds: float | None = None) -> WorkerInfo:
@@ -160,6 +164,10 @@ class Library:
 
     def __init__(self, folder: Path):
         self.folder = folder
+        # Pageable host buffers, not pinned (page-locked) ones: the output buffer above is the big one, and pinned
+        # memory can't be paged out while the worker sits idle. Only 768 floats an input come back, so it costs
+        # nothing measurable. Read by ggml's CUDA backend when it allocates.
+        os.environ.setdefault("GGML_CUDA_NO_PINNED", "1")
         if hasattr(os, "add_dll_directory"):
             self._dll_dir = os.add_dll_directory(str(folder))
         os.environ["PATH"] = str(folder) + os.pathsep + os.environ.get("PATH", "")
@@ -267,7 +275,8 @@ def target_size(height: int, width: int, budget: int) -> tuple[int, int] | None:
 
 
 class LlamaEmbedder:
-    def __init__(self, text_only: bool, backend: str | None = None, log: Path | None = None):
+    def __init__(self, text_only: bool, backend: str | None = None, log: Path | None = None,
+                 max_tokens: int | None = None):
         started = time.time()
         self.backend = backend or downloads.best_backend()
         folder = downloads.runtime_folder(self.backend)
@@ -290,7 +299,7 @@ class LlamaEmbedder:
             raise WorkerError(f"can't load {text_path}")
         # One input must fit one micro-batch: 2048 tokens (the reference's cut), which also holds a 1120-token image or
         # a 750-token 30 s clip. Queries are short, so the query encoder reserves less and cuts at 512.
-        self.max_tokens = 512 if text_only else 2048
+        self.max_tokens = max_tokens or (512 if text_only else INDEX_MAX_TOKENS)
         params = L.llama_context_default_params()
         params.n_ctx = params.n_batch = params.n_ubatch = self.max_tokens
         params.n_seq_max = MAX_SEQUENCES

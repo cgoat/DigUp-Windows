@@ -49,6 +49,8 @@ class QueryService(QObject):
         self._vectors: dict[str, list[float]] = {}
         self._image_vectors: dict[tuple, list[float]] = {}  # (path, size, mtime) -> vector: "Show more" is instant
         self._media = None  # the full model (image encoder too), only while searching by picture
+        self._image_faces: dict[tuple, object] = {}  # (path, size, mtime) -> its face vectors
+        self.settings = None  # the app's Settings: face search on or off
         self._media_used = 0.0
         self._media_lock = threading.Lock()
         self._idle = QTimer(self)
@@ -133,6 +135,32 @@ class QueryService(QObject):
         if result.vector is None:
             self.encoder_state.emit(f"error: {result.error}")
         return result.vector
+
+    def faces_on(self) -> bool:
+        """Face search is turned on and its models are here."""
+        from .. import faces
+
+        return bool(self.settings is not None and self.settings.faces and faces.models_ready())
+
+    def _faces_in_image(self, path: str):
+        """The face vectors in a picture (biggest first), from the picture encoder's worker; empty when face search
+        is off or there are none."""
+        import numpy as np
+
+        if not self.faces_on():
+            return np.zeros((0, 512), np.float32)
+        with self._media_lock:
+            if self._media is None or not self._media.alive:
+                return np.zeros((0, 512), np.float32)
+            self._media_used = time.time()
+            try:
+                found = self._media.faces([path])[0]
+            except Exception:  # noqa: BLE001 - faces are a bonus: the picture search goes on without them
+                return np.zeros((0, 512), np.float32)
+        if isinstance(found, dict) or not found:
+            return np.zeros((0, 512), np.float32)
+        found.sort(key=lambda f: -f["size"])
+        return np.stack([f["vector"] for f in found])
 
     def _close_if_idle(self) -> None:
         with self._media_lock:
@@ -345,30 +373,68 @@ class QueryService(QObject):
         if vector is None:
             self.results.emit(Results(key, [], 0, True, False, [], 0))
             return
-        self._search_vector(vector, kinds, generation, key, exclude=path, started=started, limit=limit)
+        face_vectors = self._image_faces.get(cache_key) if cache_key else None
+        if face_vectors is None:
+            face_vectors = self._faces_in_image(path)
+            if cache_key:
+                if len(self._image_faces) > 50:
+                    self._image_faces.clear()
+                self._image_faces[cache_key] = face_vectors
+        self._search_vector(vector, kinds, generation, key, exclude=path, started=started, limit=limit,
+                            face_vectors=face_vectors)
 
     def _run_similar(self, hit: SearchHit, kinds, generation: int, key: str, limit: int = PAGE) -> None:
         started = time.time()
         name = CODE_FILE if hit.kind == FileKind.CODE else MAIN_FILE
+        face_vectors = None
         with self._lock_search():
             searcher = self._searcher(name)
             vector = searcher.vector_of(hit.segment_id, hit.path) if searcher else None
+            if searcher and name == MAIN_FILE and self.faces_on():
+                from .. import people
+
+                row = searcher.store.db.execute("SELECT id FROM files WHERE path = ?", (hit.path,)).fetchone()
+                face_vectors = people.vectors_of(searcher.store, row[0]) if row else None
         if vector is None:
             self.results.emit(Results(key, [], 0, True, False, [], 0))
             return
         self._search_vector(vector, kinds, generation, key, exclude=hit.path, started=started,
-                            name=name, limit=limit)
+                            name=name, limit=limit, face_vectors=face_vectors)
 
     def _search_vector(self, vector, kinds, generation: int, key: str, exclude: str, started: float,
-                       name: str = MAIN_FILE, limit: int = PAGE) -> None:
+                       name: str = MAIN_FILE, limit: int = PAGE, face_vectors=None) -> None:
+        """Results that look like `vector`; with `face_vectors` (the faces in the picture), the photos with those
+        people come first: most of the picture's people first, then the closest faces."""
+        same = os.path.normcase(os.path.abspath(exclude))
+        person_hits = []
+        more_people = False
         with self._lock_search():
             searcher = self._searcher(name)
             hits = searcher.search("", vector, kinds=kinds, limit=limit + 2) if searcher else []
-        same = os.path.normcase(os.path.abspath(exclude))
-        hits = [h for h in hits if os.path.normcase(h.path) != same]
-        more, hits = len(hits) > limit, hits[:limit]
+            if searcher is not None and face_vectors is not None and len(face_vectors):
+                from .. import people
+
+                matches = people.match_faces(searcher.store, face_vectors)
+                if matches:
+                    person_hits = searcher.hits_for_files([f for f, _, _ in matches[:limit + 2]],
+                                                          [s for _, _, s in matches[:limit + 2]])
+                    faces_in_query = min(len(face_vectors), 12)
+                    for hit, (_, matched, sim) in zip(person_hits, matches):
+                        hit.excerpt = (f"Same person as in your picture (face match {sim:.2f})" if faces_in_query == 1
+                                       else f"{matched} of the {faces_in_query} people in your picture "
+                                            f"(closest face match {sim:.2f})")
+                        hit.score = 100.0 + matched + sim  # ahead of every look-alike
+                    more_people = len(matches) > len(person_hits)
+        if kinds is not None:
+            person_hits = [h for h in person_hits if h.kind in kinds]
+        person_hits = [h for h in person_hits if os.path.normcase(h.path) != same]
+        seen = {h.path for h in person_hits}
+        hits = person_hits + [h for h in hits if os.path.normcase(h.path) != same and h.path not in seen]
+        more = len(hits) > limit or (bool(person_hits) and more_people)
+        hits = hits[:limit]
         if generation == self._generation:
-            self.results.emit(Results(key, hits, strong_count(hits), True, name == CODE_FILE, [],
+            strong = len(person_hits) if person_hits else strong_count(hits)
+            self.results.emit(Results(key, hits, min(strong, len(hits)), True, name == CODE_FILE, [],
                                       (time.time() - started) * 1000, more))
 
     _search_lock = threading.Lock()

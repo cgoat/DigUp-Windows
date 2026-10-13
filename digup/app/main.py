@@ -44,6 +44,7 @@ class App:
         self.colors = theme.apply(qt)
         qt.setWindowIcon(theme.app_icon())
         self.service = QueryService()
+        self.service.settings = self.settings  # face search on or off
         self.panel = SearchPanel(self.service, self.settings)
         self.panel.open_settings.connect(self.show_settings)
         self.engine = Engine(self.settings)

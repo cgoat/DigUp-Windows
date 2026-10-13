@@ -290,6 +290,37 @@ def same_face(store, face: int, threshold: float = FIND, limit: int = 400) -> li
     return sorted(best.items(), key=lambda kv: -kv[1])[:limit]
 
 
+def vectors_of(store, file: int) -> np.ndarray:
+    """The face vectors of a photo in the index (its faces, biggest first)."""
+    if not ready(store):
+        return np.zeros((0, FACE_DIM), np.float32)
+    return _vectors([r[0] for r in store.db.execute("SELECT vec FROM faces WHERE file = ? ORDER BY size DESC",
+                                                    (file,))])
+
+
+def match_faces(store, queries: np.ndarray, threshold: float = FIND, exclude_file: int | None = None,
+                limit: int = 2000) -> list[tuple[int, int, float]]:
+    """Photos with the people of `queries` (face vectors, e.g. the faces of a picture searched with), one pass over
+    every face: (file, how many of the query's people are in it, best cosine), most people first, then closest."""
+    if not ready(store) or not len(queries):
+        return []
+    queries = np.asarray(queries, dtype=np.float32)[:12]  # a crowd's first dozen faces (biggest first)
+    found: dict[int, np.ndarray] = {}  # file -> best cosine per query face
+    cursor = store.db.execute("SELECT file, vec FROM faces")
+    while rows := cursor.fetchmany(16384):
+        sims = _vectors([r[1] for r in rows]) @ queries.T  # rows x query faces
+        hit = np.nonzero((sims >= threshold).any(axis=1))[0]
+        for i in hit.tolist():
+            file = rows[i][0]
+            if file == exclude_file:
+                continue
+            best = found.get(file)
+            found[file] = sims[i] if best is None else np.maximum(best, sims[i])
+    ranked = sorted(((file, int((s >= threshold).sum()), float(s.max())) for file, s in found.items()),
+                    key=lambda t: (-t[1], -t[2]))
+    return ranked[:limit]
+
+
 def counts(store) -> dict:
     db = store.db
     if not ready(store):

@@ -711,6 +711,8 @@ class SearchPanel(QWidget):
                 or getattr(target, "kind", None) not in (FileKind.DOC, FileKind.CODE, FileKind.AUDIO)
                 else "files about the same thing")
         title = "Looking for things like"
+        if kind in ("image", "similar") and self.service.faces_on() and                 getattr(target, "kind", FileKind.IMAGE) in (FileKind.IMAGE, FileKind.SCREENSHOT):
+            what = "photos with the same people first, then pictures that look like it"
         if kind == "person":
             title, what = "Photos of", "the same face, wherever it is (most alike first)"
         elif kind == "group":

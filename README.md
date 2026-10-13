@@ -35,7 +35,8 @@ own words, and it finds the match, whatever kind of file it is. All of it happen
 **People (optional).** EmbeddingGemma knows what a photo shows, not who is in it, so DigUp can also recognise faces
 with InsightFace's models (Settings → People; a 290 MB download, licensed for non-commercial use only, which DigUp
 shows before downloading). Faces are grouped into people; name someone once, then search "Srinivas" or "Srinivas at
-the beach", or right-click a photo → Find this person. On an RTX 4090 that's about 0.1 s a photo, once.
+the beach", or right-click a photo → Find this person. Searching with a picture puts the photos with the same
+people first (most of its people, then the closest faces), ahead of pictures that only look alike. On an RTX 4090 that's about 0.1 s a photo, once.
 
 Exact words count too: invoice numbers, error codes and names are matched as written, in file names, document text and
 the text inside screenshots, so a search gets both the meaning and the exact string.

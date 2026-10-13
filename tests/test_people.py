@@ -85,3 +85,19 @@ def test_a_changed_photo_is_looked_at_again(tmp_path):
     store.requeue_changed(fid, Candidate(r"C:\p\x.jpg", FileKind.IMAGE, 2, 2.0, 1, 1))
     store.finish(fid, "done")
     assert people.faces_in(store, fid) == [] and people.to_scan_count(store) == 1
+
+
+def test_a_picture_finds_the_photos_with_its_people_first(tmp_path):
+    store = IndexStore(tmp_path)
+    dave, erin, frank = unit(), unit(), unit()
+    only_dave = photo(store, "dave.jpg", 1, [person_like(dave)])
+    dave_and_erin = photo(store, "dave_erin.jpg", 2, [person_like(dave), person_like(erin)])
+    erin_alone = photo(store, "erin.jpg", 3, [person_like(erin)])
+    photo(store, "frank.jpg", 4, [person_like(frank)])
+    # A group picture of Dave and Erin, searched with: the photo with both first, then each of them alone.
+    query = np.stack([person_like(dave), person_like(erin)])
+    ranked = people.match_faces(store, query)
+    assert ranked[0][0] == dave_and_erin and ranked[0][1] == 2
+    assert {f for f, _, _ in ranked[1:]} == {only_dave, erin_alone}
+    assert people.match_faces(store, query, exclude_file=dave_and_erin)[0][0] in (only_dave, erin_alone)
+    assert len(people.vectors_of(store, dave_and_erin)) == 2

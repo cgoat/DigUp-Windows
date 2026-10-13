@@ -438,8 +438,26 @@ class SearchPanel(QWidget):
         self.empty.setObjectName("Empty")
         self.empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.empty.setWordWrap(True)
+        self.more = QPushButton("Show more")
+        self.more.setObjectName("More")
+        self.more.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.more.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.more.clicked.connect(self.show_more)
+        self.more.hide()
+        self.results_box = QWidget()
+        box = QVBoxLayout(self.results_box)
+        box.setContentsMargins(0, 0, 0, 0)
+        box.setSpacing(0)
+        box.addWidget(self.list, 1)
+        more_row = QHBoxLayout()
+        more_row.setContentsMargins(14, 6, 14, 10)
+        more_row.addWidget(self.more)
+        more_row.addStretch(1)
+        box.addLayout(more_row)
+        self.limit = QueryService.PAGE  # results asked for; "Show more" adds a page
+        self._loading_more = 0  # how many results were shown before "Show more" (0: not loading more)
         left = QStackedWidget()
-        left.addWidget(self.list)
+        left.addWidget(self.results_box)
         left.addWidget(self.empty)
         self.left = left
         self.preview = Preview(self)
@@ -535,6 +553,7 @@ class SearchPanel(QWidget):
 
     def _filter(self, index: int) -> None:
         self.kinds = FILTERS[index][1]
+        self.limit = QueryService.PAGE
         if self.image_query:
             self._run_image_query()
         else:
@@ -549,19 +568,28 @@ class SearchPanel(QWidget):
         if self.image_query:
             return
         text = self.search.text().strip()
+        if text != self.last_query:
+            self.limit = QueryService.PAGE
         self.last_query = text
         if not text:
             self.model.set([], 0)
             self._show_empty("Search your pictures, PDFs, documents, recordings and videos by what's in them.")
             self.preview.show_hit(None)
             return
-        self.service.search(text, self.kinds)
+        self.service.search(text, self.kinds, self.limit)
 
     def _show_results(self, results: Results) -> None:
         if results.query.strip() != self.last_query:
             return
         self.words = results.words
         previous = self.current_hit()
+        shown_before = self._loading_more
+        if shown_before and not results.final:
+            return  # a words-only pass would shrink the list while more are loading
+        self._loading_more = 0
+        self.more.setEnabled(True)
+        self.more.setText(f"Show {QueryService.PAGE} more")
+        self.more.setVisible(results.final and results.more)
         self.model.set(results.hits, results.strong)
         if not results.hits and self.image_query:
             self._show_empty("Nothing in your folders looks like that.")
@@ -571,15 +599,24 @@ class SearchPanel(QWidget):
             self._show_empty("Looking…" if not results.final else "Nothing found.\nTry describing it another way.")
             self.preview.show_hit(None)
             return
-        self.left.setCurrentWidget(self.list)
+        self.left.setCurrentWidget(self.results_box)
         row = 0
-        if previous is not None:
+        if shown_before and shown_before < len(results.hits):
+            row = shown_before  # the first of the new ones
+        elif previous is not None:
             for i, h in enumerate(results.hits):
                 if h.path == previous.path:
                     row = i
                     break
         self.list.setCurrentIndex(self.model.index(row))
-        found = f"{len(results.hits)} result" + ("" if len(results.hits) == 1 else "s") + ("" if results.final else " (matching words; meaning on its way)")
+        self.list.scrollTo(self.model.index(row), QAbstractItemView.ScrollHint.PositionAtTop if shown_before
+                           else QAbstractItemView.ScrollHint.EnsureVisible)
+        n = len(results.hits)
+        found = f"{n:,} result" + ("" if n == 1 else "s")
+        if not results.final:
+            found += " (matching words; meaning on its way)"
+        elif results.more:
+            found += ", more below"
         self._set_status(found)
 
     def _show_empty(self, text: str) -> None:
@@ -652,6 +689,7 @@ class SearchPanel(QWidget):
 
     def _start_image_query(self, query, image: QImage | None) -> None:
         self.image_query = query
+        self.limit = QueryService.PAGE
         self.search.blockSignals(True)
         self.search.clear()
         self.search.blockSignals(False)
@@ -677,13 +715,27 @@ class SearchPanel(QWidget):
         key = f"{kind}:{target if kind == 'image' else target.path}"
         self.last_query = key
         self.words = []
-        self.model.set([], 0)
-        self.preview.show_hit(None)
-        self._show_empty("Looking at the picture…" if kind == "image" else "Looking…")
+        if not self._loading_more:
+            self.model.set([], 0)
+            self.preview.show_hit(None)
+            self._show_empty("Looking at the picture…" if kind == "image" else "Looking…")
         if kind == "image":
-            self.service.search_image(target, self.kinds, key)
+            self.service.search_image(target, self.kinds, key, self.limit)
         else:
-            self.service.search_similar(target, self.kinds, key)
+            self.service.search_similar(target, self.kinds, key, self.limit)
+
+    def show_more(self) -> None:
+        """The next page of results, below the ones shown (the query's vector is cached: no model work)."""
+        if self._loading_more or not self.model.hits:
+            return
+        self._loading_more = len(self.model.hits)
+        self.limit += QueryService.PAGE
+        self.more.setText("Loading…")
+        self.more.setEnabled(False)
+        if self.image_query:
+            self._run_image_query()
+        else:
+            self.service.search(self.last_query, self.kinds, self.limit)
 
     def _end_image_query(self) -> None:
         self.image_query = None
@@ -749,7 +801,11 @@ class SearchPanel(QWidget):
         count = self.model.rowCount()
         if not count:
             return
-        row = max(0, min(count - 1, self.list.currentIndex().row() + step))
+        current = self.list.currentIndex().row()
+        if step > 0 and current == count - 1 and self.more.isVisible():
+            self.show_more()
+            return
+        row = max(0, min(count - 1, current + step))
         self.list.setCurrentIndex(self.model.index(row))
 
     def eventFilter(self, obj, event) -> bool:

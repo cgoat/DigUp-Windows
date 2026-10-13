@@ -63,6 +63,9 @@ def stylesheet(p: Palette) -> str:
                selection-background-color: {p.accent}; selection-color: {p.accent_text}; }}
     #Gear {{ background: transparent; border: none; color: {p.muted}; padding: 4px 8px; border-radius: 6px; }}
     #Gear:hover {{ background: {p.raised}; color: {p.text}; }}
+    #More {{ background: transparent; border: 1px solid {p.border}; border-radius: 6px; padding: 5px 14px;
+              color: {p.text}; }}
+    #More:hover {{ border-color: {p.accent}; color: {p.accent}; }}
     #QueryBar {{ background: transparent; }}
     #Card {{ background: {p.surface}; border: 1px solid {p.border}; border-radius: 8px; }}
     #CardValue {{ font-size: 16pt; font-weight: 600; }}

@@ -247,13 +247,13 @@ class Searcher:
             try:
                 rows = db.execute(
                     "SELECT s.file, s.id, snippet(fts, 1, '«', '»', '…', 12), fts.original FROM fts "
-                    "JOIN segments s ON s.id = fts.rowid WHERE fts MATCH ? ORDER BY bm25(fts, 3.0, 1.0) LIMIT 1000",
-                    (" OR ".join(pats),),
+                    "JOIN segments s ON s.id = fts.rowid WHERE fts MATCH ? ORDER BY bm25(fts, 3.0, 1.0) LIMIT ?",
+                    (" OR ".join(pats), max(1000, limit * 10)),
                 ).fetchall()
             except Exception:
                 rows = []
             for file, seg, snip, original in rows:
-                if len(word_hits) >= 100 or not allowed(file) or file in seen:
+                if len(word_hits) >= max(100, limit) or not allowed(file) or file in seen:
                     continue
                 seen.add(file)
                 quoted = searchtext.snippet(original, words_) if original else None

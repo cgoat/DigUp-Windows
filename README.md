@@ -59,6 +59,7 @@ telemetry.
 | Ctrl+Enter | Shows it in File Explorer |
 | Ctrl+C | Copies the file, to paste anywhere |
 | Ctrl+Shift+F | Finds results like the selected one (also on the right-click menu) |
+| ↓ on the last result | Loads 40 more (so does the **Show more** button under the results) |
 | Ctrl+V | Pasting a picture searches with it; so does dropping one on the window |
 | Ctrl+Space | Plays the video or recording in the preview, from the moment it matched |
 | Tab | Narrows to pictures, screenshots, PDFs, documents, audio or video |

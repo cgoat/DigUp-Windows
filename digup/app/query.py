@@ -30,6 +30,7 @@ class Results:
     code: bool
     words: list[str]
     millis: float
+    more: bool = False  # there are more results past these ("Show more")
 
 
 class QueryService(QObject):
@@ -46,6 +47,7 @@ class QueryService(QObject):
         self._stale: set[str] = set()
         self._generation = 0
         self._vectors: dict[str, list[float]] = {}
+        self._image_vectors: dict[tuple, list[float]] = {}  # (path, size, mtime) -> vector: "Show more" is instant
         self._media = None  # the full model (image encoder too), only while searching by picture
         self._media_used = 0.0
         self._media_lock = threading.Lock()
@@ -179,13 +181,16 @@ class QueryService(QObject):
                 searcher._reload_files()
         return searcher
 
-    def search(self, text: str, kinds: set[FileKind] | None = None) -> None:
-        """Searches in the background; `results` fires once with words, then with meaning."""
+    PAGE = 40  # results per page; "Show more" asks for the next one
+
+    def search(self, text: str, kinds: set[FileKind] | None = None, limit: int = PAGE) -> None:
+        """Searches in the background; `results` fires once with words, then with meaning. Past the first page
+        ("Show more") it fires once, with meaning: the query's vector is cached, so that's quick."""
         self._generation += 1
         generation = self._generation
-        threading.Thread(target=self._run, args=(text, kinds, generation), daemon=True).start()
+        threading.Thread(target=self._run, args=(text, kinds, generation, limit), daemon=True).start()
 
-    def _run(self, text: str, kinds, generation: int) -> None:
+    def _run(self, text: str, kinds, generation: int, limit: int = PAGE) -> None:
         code_text = CodeQuery.text_of(text)
         code = code_text is not None
         query = code_text if code else text
@@ -200,8 +205,8 @@ class QueryService(QObject):
                 self.results.emit(Results(text, [], 0, True, code, words, 0))
                 return
             started = time.time()
-            quick = searcher.search(query, None, kinds=kinds, limit=30, prefix_last=True)
-            if generation == self._generation:
+            quick = [] if limit > self.PAGE else searcher.search(query, None, kinds=kinds, limit=30, prefix_last=True)
+            if quick and generation == self._generation:
                 self.results.emit(Results(text, quick, strong_count(quick), False, code, words,
                                           (time.time() - started) * 1000))
         vector = self._encode(Prompts.code_query(query) if code else Prompts.query(query))
@@ -209,35 +214,50 @@ class QueryService(QObject):
             return
         with self._lock_search():
             started = time.time()
-            hits = searcher.search(query, vector, kinds=kinds, limit=40, prefix_last=vector is None)
+            hits = searcher.search(query, vector, kinds=kinds, limit=limit + 1, prefix_last=vector is None)
+        more, hits = len(hits) > limit, hits[:limit]
         if generation == self._generation:
-            self.results.emit(Results(text, hits, strong_count(hits), True, code, words, (time.time() - started) * 1000))
+            self.results.emit(Results(text, hits, strong_count(hits), True, code, words, (time.time() - started) * 1000,
+                                      more))
 
     # MARK: Searching by picture
 
-    def search_image(self, path: str, kinds: set[FileKind] | None = None, key: str | None = None) -> None:
+    def search_image(self, path: str, kinds: set[FileKind] | None = None, key: str | None = None,
+                     limit: int = PAGE) -> None:
         """Pictures, video moments and pages that look like the image at `path` (any picture, indexed or not)."""
         self._generation += 1
-        threading.Thread(target=self._run_image, args=(path, kinds, self._generation, key or f"image:{path}"),
+        threading.Thread(target=self._run_image, args=(path, kinds, self._generation, key or f"image:{path}", limit),
                          daemon=True).start()
 
-    def search_similar(self, hit: SearchHit, kinds: set[FileKind] | None = None, key: str | None = None) -> None:
+    def search_similar(self, hit: SearchHit, kinds: set[FileKind] | None = None, key: str | None = None,
+                       limit: int = PAGE) -> None:
         """Results like `hit`, from the vector the index already holds for it (no model needed)."""
         self._generation += 1
-        threading.Thread(target=self._run_similar, args=(hit, kinds, self._generation, key or f"similar:{hit.path}"),
-                         daemon=True).start()
+        threading.Thread(target=self._run_similar,
+                         args=(hit, kinds, self._generation, key or f"similar:{hit.path}", limit), daemon=True).start()
 
-    def _run_image(self, path: str, kinds, generation: int, key: str) -> None:
+    def _run_image(self, path: str, kinds, generation: int, key: str, limit: int = PAGE) -> None:
         started = time.time()
-        vector = self._encode_image(path)
+        try:
+            st = os.stat(path)
+            cache_key = (path, st.st_size, st.st_mtime)
+        except OSError:
+            cache_key = None
+        vector = self._image_vectors.get(cache_key) if cache_key else None
+        if vector is None:
+            vector = self._encode_image(path)
+            if vector is not None and cache_key:
+                if len(self._image_vectors) > 50:
+                    self._image_vectors.clear()
+                self._image_vectors[cache_key] = vector
         if generation != self._generation:
             return
         if vector is None:
             self.results.emit(Results(key, [], 0, True, False, [], 0))
             return
-        self._search_vector(vector, kinds, generation, key, exclude=path, started=started)
+        self._search_vector(vector, kinds, generation, key, exclude=path, started=started, limit=limit)
 
-    def _run_similar(self, hit: SearchHit, kinds, generation: int, key: str) -> None:
+    def _run_similar(self, hit: SearchHit, kinds, generation: int, key: str, limit: int = PAGE) -> None:
         started = time.time()
         name = CODE_FILE if hit.kind == FileKind.CODE else MAIN_FILE
         with self._lock_search():
@@ -247,18 +267,19 @@ class QueryService(QObject):
             self.results.emit(Results(key, [], 0, True, False, [], 0))
             return
         self._search_vector(vector, kinds, generation, key, exclude=hit.path, started=started,
-                            name=name)
+                            name=name, limit=limit)
 
     def _search_vector(self, vector, kinds, generation: int, key: str, exclude: str, started: float,
-                       name: str = MAIN_FILE) -> None:
+                       name: str = MAIN_FILE, limit: int = PAGE) -> None:
         with self._lock_search():
             searcher = self._searcher(name)
-            hits = searcher.search("", vector, kinds=kinds, limit=41) if searcher else []
+            hits = searcher.search("", vector, kinds=kinds, limit=limit + 2) if searcher else []
         same = os.path.normcase(os.path.abspath(exclude))
-        hits = [h for h in hits if os.path.normcase(h.path) != same][:40]
+        hits = [h for h in hits if os.path.normcase(h.path) != same]
+        more, hits = len(hits) > limit, hits[:limit]
         if generation == self._generation:
             self.results.emit(Results(key, hits, strong_count(hits), True, name == CODE_FILE, [],
-                                      (time.time() - started) * 1000))
+                                      (time.time() - started) * 1000, more))
 
     _search_lock = threading.Lock()
 

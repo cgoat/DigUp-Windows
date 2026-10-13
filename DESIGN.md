@@ -100,6 +100,21 @@ The app shows keyword matches as you type (prefix match on the last word), then 
 encoder returns the vector. The encoder is a text-only worker (~300 MB) started when the panel opens and stopped five
 minutes after the last search; vectors are loaded on the first meaning search and released with it.
 
+## People
+
+EmbeddingGemma 2 embeds what a picture shows; two people with the same hair and setting are neighbours to it. Faces
+use InsightFace's buffalo_l ([faces.py](digup/faces.py)): SCRFD-10GF finds faces and five landmarks, ArcFace R50
+(WebFace600K) turns each aligned 112x112 face into 512 numbers. Pre- and post-processing follow InsightFace's code
+(anchors, NMS, the similarity transform to its landmark template), on ONNX Runtime with DirectML, in the embedding
+worker. The models are licensed for non-commercial research only, so they're downloaded only from Settings → People,
+after the licence is shown, with pinned checksums.
+
+[people.py](digup/people.py): faces are stored with their file (deleted with it, looked at again when it changes) and
+grouped strictly (cosine ≥ 0.5 to a group's average face; loose faces form a group only with another), so a group is
+one person; one name on two groups merges them. On a real drive, 2 of 457 groups held two faces of one photo (the
+check that needs no labels: two faces in one photo are two people). A name in a query narrows the search to that
+person's photos and the remaining words order them; "Find this person" compares a face with every face (≥ 0.42).
+
 ## The app
 
 - **Window** ([panel.py](digup/app/panel.py)): an ordinary window (title bar, resizable, in the taskbar; it stays

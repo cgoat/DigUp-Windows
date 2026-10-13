@@ -98,7 +98,8 @@ class PeoplePage(QWidget):
         top.addWidget(self.summary, 1)
         v.addLayout(top)
         hint = QLabel("Double-click someone to name them. Giving two groups the same name merges them (one person "
-                      "can start out as two groups). Right-click for more.")
+                      "can start out as two groups). Right-click for more.\n"
+                      "Face models: InsightFace buffalo_l, licensed for non-commercial use only.")
         hint.setObjectName("Muted")
         hint.setWordWrap(True)
         v.addWidget(hint)

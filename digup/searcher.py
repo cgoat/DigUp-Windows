@@ -271,7 +271,9 @@ class Searcher:
             scores = self.score(query_vector)
             modality = np.asarray(cols["modality"][:n])
             z = meaning(scores, modality, (np.asarray(cols["sets_scale"][:n]) == 1) & alive)
-            keep = alive & (z > 0)  # below the average: it neither qualifies nor adds to a score
+            # Below the average a vector neither qualifies nor adds to a score; within a given set of files (a
+            # person's photos) every one stays, and meaning only orders them.
+            keep = alive & (z > 0) if only_files is None else alive.copy()
             if kinds is not None:
                 keep &= np.isin(np.asarray(cols["kind"][:n]), [KIND_CODES[k] for k in kinds])
             if only_files is not None:
@@ -326,7 +328,10 @@ class Searcher:
             file_kind.update(self._kinds_of({f for f in candidates if f not in best} - set(file_kind)))
         scored: dict[int, float] = {}
         for file in candidates:
-            s = meaning_weight * max(best[file][0] if file in best else 0, 0) + words_weight * coverage.get(file, 0) ** 1.5
+            z_file = best[file][0] if file in best else (0 if only_files is None else -1e3)
+            # Within a given set of files every one is shown, so below-average ones still need their order.
+            s = (meaning_weight * (z_file if only_files is not None else max(z_file, 0))
+                 + words_weight * coverage.get(file, 0) ** 1.5)
             if kind_of(file) in hinted:
                 s += 1
             scored[file] = s

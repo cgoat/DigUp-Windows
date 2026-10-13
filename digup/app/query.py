@@ -255,7 +255,8 @@ class QueryService(QObject):
             if generation != self._generation:
                 return True
             with self._lock_search():
-                hits = searcher.search(rest, vector, kinds=kinds, limit=limit + 1, z_gate=0.5,
+                # Every photo of theirs qualifies; the words (by meaning, and exactly) put the fitting ones first.
+                hits = searcher.search(rest, vector, kinds=kinds, limit=limit + 1, z_gate=-1e9,
                                        only_files=set(files))
         more, hits = len(hits) > limit, hits[:limit]
         if generation == self._generation:

@@ -195,7 +195,8 @@ class FaceModels:
         out = []
         for j, i in enumerate(keep):
             x1, y1, x2, y2, score = dets[i]
-            out.append(Face((max(0.0, x1 / w), max(0.0, y1 / h), (x2 - x1) / w, (y2 - y1) / h), float(score),
+            box = (max(0.0, float(x1) / w), max(0.0, float(y1) / h), float(x2 - x1) / w, float(y2 - y1) / h)
+            out.append(Face(box, float(score),
                             vectors[j].astype(np.float32), int(sizes[i])))
         return out
 

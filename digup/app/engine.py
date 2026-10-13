@@ -56,6 +56,7 @@ class Engine(QObject):
     status = Signal(object)  # Status
     changed = Signal(str)  # an index file name: its searcher should reload
     message = Signal(str)
+    people_changed = Signal()  # faces were found or grouped
 
     def __init__(self, settings: Settings):
         super().__init__()
@@ -315,7 +316,7 @@ class Engine(QObject):
         pending = indexer.store.pending_count()
         unfinished, left = indexer.store.unfinished_count()
         if not pending and not unfinished:
-            return False
+            return self._faces(indexer, name)
         label = "code" if name == CODE_FILE else "files"
         changed_since = [0]
 
@@ -335,6 +336,21 @@ class Engine(QObject):
             self._emit(phase="finishing", done=0, total=left, note=f"the rest of {unfinished} long files")
             indexer.finish_long_files(should_stop=self._should_stop, on_step=on_event)
         self.changed.emit(name)
+        self._faces(indexer, name)
+        return True
+
+    def _faces(self, indexer: Indexer, name: str) -> bool:
+        """People in photos, once everything else is read: only when turned on and the face models are there."""
+        from .. import faces, people
+
+        if name != MAIN_FILE or not self.settings.faces or not faces.models_ready() or self._should_stop():
+            return False
+        people.ensure(indexer.store)
+        if not people.to_scan_count(indexer.store):
+            return False
+        self._emit(phase="faces", done=0, total=people.to_scan_count(indexer.store), note="finding people", current="")
+        indexer.scan_faces(self._should_stop, lambda done, total: self._emit(phase="faces", done=done, total=total))
+        self.people_changed.emit()
         return True
 
     def _counts(self, indexers: dict[str, Indexer]) -> dict:

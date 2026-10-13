@@ -160,6 +160,8 @@ class OverviewPage(QWidget):
             text = f"<b>{what}:</b> {status.done:,} of {status.total:,}"
             if status.current:
                 text += f" — {os.path.basename(status.current)}"
+        elif status.phase == "faces" and status.total:
+            text = f"<b>Finding people in photos:</b> {status.done:,} of {status.total:,}"
         elif status.phase == "syncing":
             text = "<b>Scanning</b> your folders for new and changed files…"
         elif status.phase == "paused":

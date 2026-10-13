@@ -221,14 +221,26 @@ def pdf_page_texts(path: str, up_to: int) -> list[str]:
 # MARK: Documents
 
 
-def read_text_file(path: str) -> str:
-    data = Path(path).read_bytes()
+# DigUp reads at most 5,000 passages of a document (~9 million characters): past that it's a machine-made giant (a
+# log, a data dump). Reading more only cost memory: a 400 MB log read whole, with its copies, took gigabytes.
+MAX_TEXT_BYTES = 24 << 20
+
+
+def read_text_file(path: str, limit: int = MAX_TEXT_BYTES) -> str:
+    """A text file's start (all of it when it's under `limit`), decoded: UTF-8, UTF-16 by its BOM, else Windows-1252."""
+    with open(path, "rb") as f:
+        data = f.read(limit)
+    if len(data) == limit:
+        # Cut in the middle of a character? Drop the partial one (UTF-16: keep whole code units).
+        data = data[: len(data) - (len(data) % 2)] if data[:2] in (b"\xff\xfe", b"\xfe\xff") else data
     for bom, codec in ((b"\xef\xbb\xbf", "utf-8-sig"), (b"\xff\xfe", "utf-16"), (b"\xfe\xff", "utf-16")):
         if data.startswith(bom):
             return data.decode(codec, "replace")
     try:
         return data.decode("utf-8")
-    except UnicodeDecodeError:
+    except UnicodeDecodeError as error:
+        if len(data) == limit and error.start >= len(data) - 3:
+            return data[: error.start].decode("utf-8", "replace")  # the cut split the last character
         return data.decode("cp1252", "replace")
 
 

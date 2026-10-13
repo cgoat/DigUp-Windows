@@ -10,10 +10,11 @@ ROOT = os.path.dirname(SPECPATH)
 J = os.path.join
 ICON = J(ROOT, "digup", "app", "resources", "digup.ico")
 
-hidden = collect_submodules("winrt") + collect_submodules("digup") + ["pillow_heif", "pypdfium2"]
+hidden = collect_submodules("winrt") + collect_submodules("digup") + ["pillow_heif", "pypdfium2", "onnxruntime", "cv2"]
 datas = (collect_data_files("imageio_ffmpeg") + collect_data_files("pypdfium2_raw") + collect_data_files("winrt")
          + [(J(ROOT, "digup", "app", "resources"), "digup/app/resources")])
-binaries = collect_dynamic_libs("pypdfium2_raw") + collect_dynamic_libs("pillow_heif")
+binaries = (collect_dynamic_libs("pypdfium2_raw") + collect_dynamic_libs("pillow_heif")
+            + collect_dynamic_libs("onnxruntime"))
 excludes = ["tkinter", "matplotlib", "pytest", "IPython", "PySide6.QtWebEngineCore", "PySide6.Qt3DCore",
             "PySide6.QtQuick", "PySide6.QtQml", "PySide6.QtPdf", "PySide6.QtCharts", "PySide6.QtDataVisualization"]
 

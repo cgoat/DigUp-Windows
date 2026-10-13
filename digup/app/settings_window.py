@@ -16,6 +16,7 @@ from ..settings import Settings
 from ..store import CODE_FILE
 from . import opener, theme
 from .overview import OverviewPage
+from .people_page import PeoplePage
 
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
@@ -166,6 +167,8 @@ class SettingsWindow(QWidget):
         # Overview: first, as the Settings button opens it
         self.overview = OverviewPage(settings)
         tabs.insertTab(0, self.overview, "Overview")
+        self.people = PeoplePage(settings)
+        tabs.insertTab(1, self.people, "People")
         tabs.setCurrentIndex(0)
         self.tabs = tabs
 
@@ -188,6 +191,7 @@ class SettingsWindow(QWidget):
     def set_engine(self, engine) -> None:
         self.engine = engine
         self.overview.set_engine(engine)
+        self.people.set_engine(engine)
 
     def _save(self) -> None:
         s = self.settings

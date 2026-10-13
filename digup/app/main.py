@@ -102,8 +102,9 @@ class App:
             self.panel.toggle()
 
     def _engine_status(self, status: Status) -> None:
-        if status.phase in ("indexing", "finishing") and status.total:
-            what = "Reading the rest of long files" if status.phase == "finishing" else f"Indexing {status.note}"
+        if status.phase in ("indexing", "finishing", "faces") and status.total:
+            what = {"finishing": "Reading the rest of long files",
+                    "faces": "Finding people in photos"}.get(status.phase, f"Indexing {status.note}")
             line = f"{what}: {status.done:,} of {status.total:,}"
             progress = status.done / status.total
         elif status.phase == "syncing":
@@ -150,6 +151,7 @@ class App:
         if self.settings_window is None:
             self.settings_window = SettingsWindow(self.settings)
             self.settings_window.set_engine(self.engine)
+            self.settings_window.people.show_person.connect(self._show_person)
             self.settings_window.saved.connect(self._settings_saved)
             self.settings_window.destroyed.connect(lambda: setattr(self, "settings_window", None))
             self.settings_window.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
@@ -159,6 +161,10 @@ class App:
         self.settings_window.show()
         self.settings_window.raise_()
         self.settings_window.activateWindow()
+
+    def _show_person(self, group: int, name: str, image) -> None:
+        self.panel.show_panel()
+        self.panel.show_group(group, name, image)
 
     def _settings_saved(self, folders_changed: bool, code_changed: bool) -> None:
         if self.hotkey.registered != self.settings.hotkey and not self.hotkey.register(self.settings.hotkey):

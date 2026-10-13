@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import threading
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -205,6 +206,32 @@ class Indexer:
 
         self._process([Job(b) for b in batches(queue)], should_stop, committed)
         return states
+
+    def scan_faces(self, should_stop=lambda: False, on_progress: Callable[[int, int], None] = lambda d, t: None) -> int:
+        """Looks for faces in the photos that haven't been looked at (the worker runs InsightFace), saves them, and
+        groups new faces into people every couple of thousand photos and at the end. Stops between batches."""
+        from . import people
+
+        people.ensure(self.store)
+        total = people.to_scan_count(self.store)
+        done = since_grouping = 0
+        while not should_stop():
+            batch = people.photos_to_scan(self.store, 16)
+            if not batch:
+                break
+            found = self.full_worker().faces([path for _, path in batch])
+            with self.store.transaction():
+                for (file, _), item in zip(batch, found):
+                    people.save(self.store, file, [] if isinstance(item, dict) else item)
+            done += len(batch)
+            since_grouping += len(batch)
+            on_progress(done, total)
+            if since_grouping >= 2048:
+                people.group(self.store)
+                since_grouping = 0
+        if done:
+            people.group(self.store)
+        return done
 
     def finish_long_files(self, should_stop=lambda: False, on_step: Callable[[Event], None] = lambda e: None):
         """The later pass: reads the rest of long PDFs and documents, a step at a time, each step one transaction."""
@@ -513,11 +540,10 @@ def prepare(job: Job, options: IndexOptions, folder: Path) -> Prepared:
             pages, total, title = extractors.pdf_pages(path, pick, options.min_page_text, 1400, folder)
             prepared.payload = ("pdf", pages, wanted.get("r", range(0)), total, title)
         elif kind == FileKind.DOC:
-            text = extractors.doc_text(path)
-            chunks = extractors.chunks(text, limit=options.max_chunks + 1)
+            chunks, characters = _doc_chunks(path, options)
             r = job.step or range(0, options.doc_step)
             r = range(max(r.start, 0), min(r.stop, len(chunks), options.max_chunks))
-            prepared.payload = ("doc", chunks[r.start:r.stop], r, len(chunks), len(text))
+            prepared.payload = ("doc", chunks[r.start:r.stop], r, len(chunks), characters)
         elif kind == FileKind.AUDIO:
             pieces, duration = media.audio_windows(path, options.audio_window, options.audio_hop, folder)
             prepared.payload = ("audio", pieces, duration)
@@ -537,6 +563,32 @@ def prepare(job: Job, options: IndexOptions, folder: Path) -> Prepared:
             prepared.outcomes.setdefault(slot, ("failed", message[:500]))
         prepared.payload = ("nothing",)
     return prepared
+
+
+_doc_cache: dict[tuple, tuple[list[str], int]] = {}
+_doc_lock = threading.Lock()
+
+
+def _doc_chunks(path: str, options: IndexOptions) -> tuple[list[str], int]:
+    """A document's passages, cut once and kept while its steps are read (a long one is read 40 passages a step:
+    reading and cutting it again for each step was the slow and memory-hungry part)."""
+    try:
+        st = os.stat(path)
+        key = (path, st.st_size, st.st_mtime)
+    except OSError:
+        key = None
+    with _doc_lock:
+        if key in _doc_cache:
+            return _doc_cache[key]
+    text = extractors.doc_text(path)
+    result = (extractors.chunks(text, limit=options.max_chunks + 1), len(text))
+    del text
+    if key:
+        with _doc_lock:
+            if len(_doc_cache) >= 2:
+                _doc_cache.pop(next(iter(_doc_cache)))
+            _doc_cache[key] = result
+    return result
 
 
 def _i64(value: int) -> int:

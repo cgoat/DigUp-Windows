@@ -204,6 +204,60 @@ def search_image(args) -> int:
     return 0
 
 
+def cmd_faces(args) -> int:
+    """Looks for faces in indexed photos and groups them into people (InsightFace; see `digup people`)."""
+    from . import faces, people
+    from .indexer import Indexer
+
+    if not faces.models_ready():
+        if not args.download:
+            print("the face models aren't here. They're InsightFace's buffalo_l, licensed for non-commercial use only:\n"
+                  f"  {faces.LICENSE}\nrun `digup faces --download` to get them (290 MB) if that's fine for you.")
+            return 2
+        last = [0.0]
+
+        def report(n, total):
+            if time.time() - last[0] > 1:
+                last[0] = time.time()
+                print(f"\rface models: {n / 1e6:.0f} of {total / 1e6:.0f} MB", end="", flush=True)
+
+        faces.download(report)
+        print()
+    store = _store(False)
+    indexer = Indexer(store, Settings.load().options(), _make_embedder(args))
+    started = time.time()
+    limit = args.limit
+    stop = (lambda: people.counts(store)["scanned"] >= limit) if limit else (lambda: False)
+
+    def progress(done, total):
+        print(f"\r{done:,} of {total:,} photos", end="", flush=True)
+
+    try:
+        done = indexer.scan_faces(stop, progress)
+    finally:
+        indexer.finish()
+    print(f"\nlooked at {done:,} photos in {time.time() - started:.0f} s")
+    c = people.counts(store)
+    print(f"{c['faces']:,} faces, {c['people']:,} people found, {c['named']:,} named, {c['to_scan']:,} photos to go")
+    return 0
+
+
+def cmd_people(args) -> int:
+    from . import people
+
+    store = _store(False)
+    people.ensure(store)
+    if args.name:
+        group, name = int(args.name[0]), " ".join(args.name[1:])
+        now = people.rename(store, group, name)
+        print(f"group {group} is now {name!r}" + (f" (merged into group {now})" if now != group else ""))
+        return 0
+    for person in people.people(store, include_hidden=args.all)[: args.limit]:
+        print(f"{person.id:6}  {person.name or '(unnamed)':24} {person.photos:6,} photos  {person.faces:6,} faces"
+              + ("  hidden" if person.hidden else ""))
+    return 0
+
+
 def cmd_status(args) -> int:
     settings = Settings.load()
     backend = downloads.best_backend()
@@ -284,6 +338,18 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--remove", nargs="*")
     p.add_argument("--code", action="store_true")
     p.set_defaults(func=cmd_folders)
+
+    p = sub.add_parser("faces", help="find people in indexed photos (InsightFace, non-commercial licence)")
+    p.add_argument("--download", action="store_true", help="download the face models (after reading their licence)")
+    p.add_argument("--limit", type=int, help="stop after this many photos have been looked at")
+    p.add_argument("--in-process", action="store_true")
+    p.set_defaults(func=cmd_faces)
+
+    p = sub.add_parser("people", help="the people found, or --name GROUP NAME to name one")
+    p.add_argument("--name", nargs="+", metavar=("GROUP", "NAME"))
+    p.add_argument("--all", action="store_true", help="hidden ones too")
+    p.add_argument("--limit", type=int, default=40)
+    p.set_defaults(func=cmd_people)
 
     p = sub.add_parser("worker", help="the embedding worker (JSON lines on stdin/stdout)")
     p.add_argument("--text-only", action="store_true")

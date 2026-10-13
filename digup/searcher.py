@@ -234,7 +234,9 @@ class Searcher:
         return out
 
     def search(self, text: str, query_vector=None, kinds: set[FileKind] | None = None, limit: int = 20,
-               z_gate: float = 2.0, word_weight: float | None = None, prefix_last: bool = False) -> list[SearchHit]:
+               z_gate: float = 2.0, word_weight: float | None = None, prefix_last: bool = False,
+               only_files: set[int] | None = None) -> list[SearchHit]:
+        """`only_files`: search within these files (a person's photos)."""
         word_weight = word_weight if word_weight is not None else (CODE_WORD_WEIGHT if self.is_code else WORD_WEIGHT)
         if query_vector is not None and not self.vectors_loaded:
             self.reload()
@@ -272,6 +274,8 @@ class Searcher:
             keep = alive & (z > 0)  # below the average: it neither qualifies nor adds to a score
             if kinds is not None:
                 keep &= np.isin(np.asarray(cols["kind"][:n]), [KIND_CODES[k] for k in kinds])
+            if only_files is not None:
+                keep &= np.isin(np.asarray(cols["files"][:n]), np.fromiter(only_files, dtype=np.int64))
             rows = np.nonzero(keep)[0]
             if rows.size:
                 order = rows[np.argsort(-z[rows], kind="stable")]
@@ -284,6 +288,8 @@ class Searcher:
             return file_kind.get(file) or best.kind_of(file)
 
         def allowed(file: int) -> bool:
+            if only_files is not None and file not in only_files:
+                return False
             return kinds is None or kind_of(file) in kinds
 
         # Words: FTS5 with Porter stemming over names, folders, OCR, page and document text (fetched above).
@@ -399,6 +405,25 @@ class Searcher:
         first = int(row[0] or 1) if row else 1
         line = codeextract.first_line(words_ if ident is None else [name.lower()], text, first)
         return segment, (float(line) if line else None)
+
+    def hits_for_files(self, files: list[int], scores: list[float] | None = None) -> list[SearchHit]:
+        """Files as results, in the order given (a person's photos, or "find this person"): each points at its
+        picture."""
+        db = self.store.db
+        hits = []
+        for i, file in enumerate(files):
+            row = db.execute("SELECT path, kind, mtime, size, info FROM files WHERE id = ?", (file,)).fetchone()
+            if not row:
+                continue
+            seg = db.execute("SELECT id, kind, loc, loc_end FROM segments WHERE file = ? ORDER BY "
+                             "CASE kind WHEN 'image' THEN 0 WHEN 'frame' THEN 1 ELSE 2 END, id LIMIT 1",
+                             (file,)).fetchone() or (0, "name", None, None)
+            score = scores[i] if scores else 1.0
+            hits.append(SearchHit(path=row[0], kind=FileKind(row[1]), score=score, z=None, cosine=score,
+                                  keyword_rank=None, segment=SegmentKind(seg[1]), segment_id=seg[0], loc=seg[2],
+                                  loc_end=seg[3], excerpt=None, modified=row[2], size=row[3],
+                                  info=json.loads(row[4]) if row[4] else {}))
+        return hits
 
     def vector_of(self, segment_id: int, path: str | None = None) -> list[float] | None:
         """A stored vector to search with ("find similar"): the segment's own, else the file's picture (its image,

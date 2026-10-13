@@ -140,6 +140,9 @@ class IndexStore:
             from .vectorcache import install_trigger
 
             install_trigger(self.db)
+            from . import people
+
+            people.install(self.db)  # faces and the people they belong to (only filled when faces are on)
         except sqlite3.OperationalError:
             pass  # another process holds the write lock; it will be made next time
 
@@ -219,8 +222,13 @@ class IndexStore:
         return cur.lastrowid
 
     def requeue_changed(self, id: int, file: Candidate) -> None:
-        """The file changed on disk: drop what was read from it and queue it again."""
+        """The file changed on disk: drop what was read from it (its faces too) and queue it again."""
         self._delete_segments(id, keeping_name=True)
+        try:
+            self.db.execute("DELETE FROM faces WHERE file = ?", (id,))
+            self.db.execute("DELETE FROM face_scans WHERE file = ?", (id,))
+        except sqlite3.OperationalError:
+            pass  # an index from before faces: no such tables
         self.db.execute(
             "UPDATE files SET kind = ?, size = ?, mtime = ?, inode = ?, device = ?, state = 'pending', detail = NULL, "
             "info = NULL, indexed_at = NULL WHERE id = ?",

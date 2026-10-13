@@ -14,6 +14,8 @@ dependencies = [
     "watchdog>=5.0",              # new files become searchable seconds after they land
     "PySide6-Essentials>=6.8",    # tray app, search panel, settings
     "PySide6-Addons>=6.8",        # QtMultimedia: previews that play at the moment
+    "onnxruntime-directml>=1.20; sys_platform == 'win32'",   # face models (People), on any GPU via DirectML
+    "opencv-python-headless>=4.10",  # face alignment for the face models
     "winrt-runtime>=2.3; sys_platform == 'win32'",              # Windows.Media.Ocr for screenshot text
     "winrt-Windows.Media.Ocr>=2.3; sys_platform == 'win32'",
     "winrt-Windows.Graphics.Imaging>=2.3; sys_platform == 'win32'",
@@ -24,7 +26,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "pyinstaller>=6.10"]
+dev = ["pytest>=8", "pyinstaller>=6.10", "pyflakes>=3", "py-spy>=0.4"]
 
 [project.scripts]
 digup = "digup.cli:main"

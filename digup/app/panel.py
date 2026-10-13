@@ -710,7 +710,12 @@ class SearchPanel(QWidget):
         what = ("pictures, screenshots, video moments and pages that look like it" if kind == "image"
                 or getattr(target, "kind", None) not in (FileKind.DOC, FileKind.CODE, FileKind.AUDIO)
                 else "files about the same thing")
-        self.query_label.setText(f"<b>Looking for things like</b> {html.escape(name)}"
+        title = "Looking for things like"
+        if kind == "person":
+            title, what = "Photos of", "the same face, wherever it is (most alike first)"
+        elif kind == "group":
+            title, what = "Photos of", "everyone DigUp grouped as this person (newest first)"
+        self.query_label.setText(f"<b>{title}</b> {html.escape(name)}"
                                  f"<br><span style='color:{self.colors.muted}'>{what}</span>")
         self.query_thumb.clear()
         if image is not None and not image.isNull():
@@ -722,9 +727,43 @@ class SearchPanel(QWidget):
         self.query_bar.show()
         self._run_image_query()
 
+    def _faces_of(self, hit) -> list[dict]:
+        """The faces in a result's photo (when faces are on), biggest first, numbered."""
+        if hit is None or hit.kind != FileKind.IMAGE or not self.settings.faces:
+            return []
+        import sqlite3
+
+        from .. import paths
+
+        try:
+            db = sqlite3.connect(f"file:{paths.index() / 'index.sqlite'}?mode=ro", uri=True, timeout=1)
+            rows = db.execute(
+                "SELECT fc.id, fc.x, fc.y, fc.w, fc.h, p.name FROM faces fc JOIN files f ON f.id = fc.file "
+                "LEFT JOIN people p ON p.id = fc.person WHERE f.path = ? ORDER BY fc.size DESC LIMIT 6",
+                (hit.path,)).fetchall()
+            db.close()
+        except sqlite3.Error:
+            return []
+        return [{"id": r[0], "box": r[1:5], "name": r[5], "n": i + 1} for i, r in enumerate(rows)]
+
+    def show_group(self, group: int, name: str, image) -> None:
+        """A group of faces' photos (Settings → People → Show their photos)."""
+        self._start_image_query(("group", group, name), image)
+
+    def find_person(self, hit, face: dict) -> None:
+        """Photos with this face in them, whoever's group it's in."""
+        from .. import faces as face_models
+
+        image = None
+        crop = face_models.crop(hit.path, face["box"], 88)
+        if crop is not None:
+            image = QImage(crop.data, crop.shape[1], crop.shape[0], crop.shape[1] * 3, QImage.Format.Format_RGB888).copy()
+        label = face["name"] or f"the person in {os.path.basename(hit.path)}"
+        self._start_image_query(("person", face["id"], label), image)
+
     def _run_image_query(self) -> None:
         kind, target, _ = self.image_query
-        key = f"{kind}:{target if kind == 'image' else target.path}"
+        key = f"{kind}:{target if kind in ('image', 'person', 'group') else target.path}"
         self.last_query = key
         self.words = []
         if not self._loading_more:
@@ -733,6 +772,10 @@ class SearchPanel(QWidget):
             self._show_empty("Looking at the picture…" if kind == "image" else "Looking…")
         if kind == "image":
             self.service.search_image(target, self.kinds, key, self.limit)
+        elif kind == "person":
+            self.service.search_person(target, key, self.kinds, self.limit)
+        elif kind == "group":
+            self.service.search_group(target, key, self.kinds, self.limit)
         else:
             self.service.search_similar(target, self.kinds, key, self.limit)
 
@@ -805,6 +848,11 @@ class SearchPanel(QWidget):
         menu = QMenu(self)
         menu.addAction("Open", self.open_selected)
         menu.addAction("Find similar\tCtrl+Shift+F", self.find_similar)
+        hit = self.current_hit()
+        for face in self._faces_of(hit):
+            who = face["name"] or "this person"
+            menu.addAction(f"Find {who}" + ("" if face["name"] else f" (face {face['n']})"),
+                           lambda f=face, h=hit: self.find_person(h, f))
         menu.addAction("Show in folder\tCtrl+Enter", self.reveal_selected)
         menu.addAction("Copy file\tCtrl+C", self.copy_selected)
         menu.exec(self.list.viewport().mapToGlobal(pos))

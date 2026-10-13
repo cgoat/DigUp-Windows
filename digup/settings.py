@@ -28,6 +28,7 @@ class Settings:
     launch_at_login: bool = False
     backend: str = "auto"  # auto | cuda | vulkan | cpu
     onboarded: bool = False
+    faces: bool = False  # find people in photos (InsightFace, downloaded only when asked for: Settings → People)
 
     @staticmethod
     def default_folders() -> list[str]:

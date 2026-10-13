@@ -48,6 +48,7 @@ def serve(text_only: bool, backend: str | None = None) -> int:
         reply({"ready": False, "error": str(error)})
         return 1
     info = embedder.info
+    face_models = None
     reply({"ready": True, "info": info.__dict__})
     for line in stdin:
         if not line.strip():
@@ -63,6 +64,22 @@ def serve(text_only: bool, backend: str | None = None) -> int:
         try:
             if op == "info":
                 reply({"id": rid, "ok": True, "info": info.__dict__})
+                continue
+            if op == "faces":
+                # The face models (InsightFace) load on first use, beside the embedding model.
+                if face_models is None:
+                    from .faces import FaceModels
+
+                    face_models = FaceModels()
+                found = []
+                for path in inputs:
+                    try:
+                        found.append([{"box": f.box, "score": f.score, "size": f.size,
+                                       "vector": base64.b64encode(f.vector.astype("<f2").tobytes()).decode()}
+                                      for f in face_models.faces(path)])
+                    except Exception as error:  # noqa: BLE001 - one unreadable photo
+                        found.append({"error": str(error)[:200]})
+                reply({"id": rid, "ok": True, "faces": found})
                 continue
             if op == "text":
                 vectors = [Embedding(v) for v in embedder.embed_texts(inputs)]
@@ -164,6 +181,30 @@ class EmbeddingWorker:
 
     def embed_audio(self, paths_: list[str]) -> list[Embedding]:
         return self._send("audio", paths_)
+
+    def faces(self, paths_: list[str]) -> list[list[dict] | dict]:
+        """The faces in each photo (box, score, size, 512-number vector), or {"error": ...} for one it couldn't read."""
+        if not paths_:
+            return []
+        with self._lock:
+            rid = self._next
+            self._next += 1
+            try:
+                self.process.stdin.write(json.dumps({"id": rid, "op": "faces", "inputs": paths_}).encode() + b"\n")
+                self.process.stdin.flush()
+            except OSError as error:
+                raise WorkerError(f"can't write to the worker{self._tail()}") from error
+            reply = self._read()
+        if not reply.get("ok"):
+            raise WorkerError(reply.get("error") or "no faces")
+        out = []
+        for item in reply["faces"]:
+            if isinstance(item, dict):
+                out.append(item)
+                continue
+            out.append([{**f, "vector": np.frombuffer(base64.b64decode(f["vector"]), dtype="<f2").astype(np.float32)}
+                        for f in item])
+        return out
 
     @property
     def alive(self) -> bool:

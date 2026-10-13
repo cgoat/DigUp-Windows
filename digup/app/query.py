@@ -198,6 +198,8 @@ class QueryService(QObject):
             self.results.emit(Results(text, [], 0, True, code, [], 0))
             return
         name = CODE_FILE if code else MAIN_FILE
+        if not code and self._run_people(text, query, kinds, generation, limit):
+            return
         words = terms(query)
         with self._lock_search():
             searcher = self._searcher(name)
@@ -219,6 +221,93 @@ class QueryService(QObject):
         if generation == self._generation:
             self.results.emit(Results(text, hits, strong_count(hits), True, code, words, (time.time() - started) * 1000,
                                       more))
+
+    # MARK: People
+
+    def _run_people(self, text: str, query: str, kinds, generation: int, limit: int) -> bool:
+        """A query that names someone ("Srinivas", "Srinivas at the beach"): their photos, ranked by the rest of the
+        words when there are any. False when it names nobody."""
+        from .. import people
+
+        with self._lock_search():
+            searcher = self._searcher(MAIN_FILE)
+            if searcher is None:
+                return False
+            try:
+                groups, rest = people.split_names(searcher.store, query)
+            except Exception:  # noqa: BLE001 - an index from before faces
+                return False
+            if not groups:
+                return False
+            files = people.files_of(searcher.store, groups)
+        started = time.time()
+        if not rest:
+            with self._lock_search():
+                rows = searcher.store.db.execute(
+                    f"SELECT id FROM files WHERE id IN ({','.join('?' * len(files))}) ORDER BY mtime DESC",
+                    files).fetchall() if files else []
+                ordered = [r[0] for r in rows]
+                hits = searcher.hits_for_files(ordered[:limit + 1])
+            if kinds is not None:
+                hits = [h for h in hits if h.kind in kinds]
+        else:
+            vector = self._encode(Prompts.query(rest))
+            if generation != self._generation:
+                return True
+            with self._lock_search():
+                hits = searcher.search(rest, vector, kinds=kinds, limit=limit + 1, z_gate=0.5,
+                                       only_files=set(files))
+        more, hits = len(hits) > limit, hits[:limit]
+        if generation == self._generation:
+            self.results.emit(Results(text, hits, len(hits), True, False, terms(rest), (time.time() - started) * 1000,
+                                      more))
+        return True
+
+    def search_group(self, group: int, key: str, kinds=None, limit: int = PAGE) -> None:
+        """A group's photos, newest first."""
+        self._generation += 1
+        generation = self._generation
+
+        def run():
+            from .. import people
+
+            started = time.time()
+            with self._lock_search():
+                searcher = self._searcher(MAIN_FILE)
+                files = people.files_of(searcher.store, [group]) if searcher else []
+                rows = searcher.store.db.execute(
+                    f"SELECT id FROM files WHERE id IN ({','.join('?' * len(files))}) ORDER BY mtime DESC",
+                    files).fetchall() if files else []
+                hits = searcher.hits_for_files([r[0] for r in rows][:limit + 1]) if searcher else []
+            if kinds is not None:
+                hits = [h for h in hits if h.kind in kinds]
+            more, hits = len(hits) > limit, hits[:limit]
+            if generation == self._generation:
+                self.results.emit(Results(key, hits, len(hits), True, False, [], (time.time() - started) * 1000, more))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def search_person(self, face: int, key: str, kinds=None, limit: int = PAGE) -> None:
+        """Photos with this face in them (compared with every face, not only its group)."""
+        self._generation += 1
+        generation = self._generation
+
+        def run():
+            from .. import people
+
+            started = time.time()
+            with self._lock_search():
+                searcher = self._searcher(MAIN_FILE)
+                found = people.same_face(searcher.store, face) if searcher else []
+                hits = searcher.hits_for_files([f for f, _ in found[:limit + 1]], [s for _, s in found[:limit + 1]]) \
+                    if searcher else []
+            if kinds is not None:
+                hits = [h for h in hits if h.kind in kinds]
+            more, hits = len(hits) > limit, hits[:limit]
+            if generation == self._generation:
+                self.results.emit(Results(key, hits, len(hits), True, False, [], (time.time() - started) * 1000, more))
+
+        threading.Thread(target=run, daemon=True).start()
 
     # MARK: Searching by picture
 
